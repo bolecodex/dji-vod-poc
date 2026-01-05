@@ -243,11 +243,12 @@ file:///path/to/player.html?url=<播放地址>
 ## 注意事项
 
 1. **敏感信息保护** - `.env` 文件包含敏感信息，已添加到 `.gitignore`，不会被提交到版本控制
-2. **API签名** - 当前实现使用自定义签名逻辑，如果遇到签名错误，建议使用火山引擎官方SDK
+2. **API签名** - 当前实现使用火山引擎官方SDK (`github.com/volcengine/volc-sdk-golang/service/vod`)，签名认证由SDK自动处理
 3. **工作流ID** - 当前已配置工作流ID `d4dafb5eb8c0477eac792f331f875fdc`，如需修改可在 `.env` 文件中设置 `VOD_WORKFLOW_ID`
 4. **转码时间** - 转码时间取决于视频大小和复杂度，Demo会每10秒轮询一次状态
 5. **播放地址** - 获取播放地址需要确保已配置加速域名并开启点播调度
 6. **费用** - 视频上传、转码和播放都会产生费用，请注意控制台费用
+7. **DirectUrl模式** - 当前使用DirectUrl模式触发工作流，转码完成后可能需要通过其他方式获取Vid
 
 ## 故障排查
 
@@ -259,23 +260,21 @@ file:///path/to/player.html?url=<播放地址>
 
 ### 2. 转码失败 - API签名错误
 
-如果遇到 `InvalidCredential` 错误，说明API签名有问题。当前Demo使用了自定义签名实现，可能不完全符合火山引擎的签名规范。
+如果遇到 `InvalidCredential` 错误，说明API签名有问题。
 
 **解决方案：**
 
-1. **使用火山引擎官方SDK（推荐）**
-   ```bash
-   go get github.com/volcengine/volc-sdk-golang/service/vod
-   ```
-   然后使用官方SDK替换当前的VOD客户端实现。
+1. **检查AccessKey和SecretKey**
+   - 确保 `.env` 文件中的 `ACCESS_KEY` 和 `SECRET_KEY` 正确
+   - 确保密钥格式正确（不需要base64编码，SDK会自动处理）
 
-2. **检查Secret Key格式**
-   - 确保Secret Key是base64编码格式
-   - 当前代码已尝试自动解码base64格式的Secret Key
+2. **检查区域配置**
+   - 确保 `config.yaml` 中的 `vod.region` 设置为 `cn-north-1`
+   - 确保TOS和VOD的区域配置正确
 
 3. **参考官方文档**
    - 火山引擎API签名规范：https://www.volcengine.com/docs/4/3479
-   - 确保签名算法完全符合规范
+   - VOD SDK文档：https://www.volcengine.com/docs/4/65654
 
 ### 3. 获取播放地址失败
 
@@ -285,8 +284,34 @@ file:///path/to/player.html?url=<播放地址>
 
 ## 依赖包
 
-- `github.com/volcengine/ve-tos-golang-sdk/v2` - TOS SDK
+- `github.com/volcengine/ve-tos-golang-sdk/v2` - TOS SDK（对象存储）
+- `github.com/volcengine/volc-sdk-golang/service/vod` - VOD SDK V1.0（视频点播）
 - `gopkg.in/yaml.v3` - YAML配置文件解析
+
+**注意：** 当前使用V1.0 SDK，因为V2.0 SDK (`github.com/volcengine/volcengine-go-sdk`) 目前不支持 `StartWorkflow` API。V2.0 SDK只支持 `StartExecution` API，而我们需要使用 `StartWorkflow` 来触发转码工作流。详情请参考 [V2.0 Go SDK 介绍与迁移说明](docs/V2.0%20Go%20SDK%20介绍与迁移说明.md)。
+
+## 文件结构
+
+```
+.
+├── main.go              # 主程序入口
+├── vod_client.go        # VOD客户端实现（使用官方SDK V1.0，包含接口定义和数据结构）
+├── config.yaml          # 配置文件
+├── .env_example         # 环境变量示例文件
+├── .env                 # 环境变量文件（包含敏感信息，已添加到.gitignore）
+├── player.html          # HTML5视频播放器
+├── go.mod               # Go模块依赖
+├── go.sum               # Go依赖校验和
+├── README.md            # 项目说明文档
+├── .gitignore           # Git忽略文件配置
+└── docs/                # API文档
+    ├── 对象存储普通上传.md
+    ├── 音视频转码.md
+    ├── GetPlayInfo - 获取播放地址.md
+    ├── GetWorkflowExecution - 获取工作流运行状态.md
+    ├── 点播添加对象存储.md
+    └── V2.0 Go SDK 介绍与迁移说明.md
+```
 
 ## 参考文档
 
@@ -295,6 +320,7 @@ file:///path/to/player.html?url=<播放地址>
 - [GetPlayInfo - 获取播放地址](docs/GetPlayInfo%20-%20获取播放地址.md)
 - [GetWorkflowExecution - 获取工作流运行状态](docs/GetWorkflowExecution%20-%20获取工作流运行状态.md)
 - [点播添加对象存储](docs/点播添加对象存储.md)
+- [V2.0 Go SDK 介绍与迁移说明](docs/V2.0%20Go%20SDK%20介绍与迁移说明.md)
 
 ## 许可证
 

@@ -397,8 +397,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 创建VOD客户端（使用官方SDK）
-	vodClient := NewVODClientV1(
+	// 创建VOD客户端（使用官方SDK V1.0）
+	// 注意：使用V1.0 SDK，因为V2.0 SDK目前不支持StartWorkflow API
+	vodClient := NewVODClient(
 		config.VOD.AccessKey,
 		config.VOD.SecretKey,
 		config.VOD.Region,

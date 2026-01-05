@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/volcengine/ve-tos-golang-sdk/v2/tos"
+	"github.com/volcengine/ve-tos-golang-sdk/v2/tos/enum"
 	"gopkg.in/yaml.v3"
 )
 
@@ -103,6 +106,210 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+func newTOSClient(cfg TOSConfig) (*tos.ClientV2, error) {
+	client, err := tos.NewClientV2(
+		cfg.Endpoint,
+		tos.WithRegion(cfg.Region),
+		tos.WithCredentials(tos.NewStaticCredentials(cfg.AccessKey, cfg.SecretKey)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func parseLastModified(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, fmt.Errorf("LastModified为空")
+	}
+
+	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, nil
+	}
+
+	return time.Time{}, fmt.Errorf("无法解析LastModified: %s", value)
+}
+
+func buildTranscodedOutputKey(inputObjectKey string) string {
+	dir := path.Dir(inputObjectKey)
+	base := path.Base(inputObjectKey)
+	ext := path.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if stem == "" {
+		stem = base
+	}
+
+	outName := stem + "-转码后-720P.mp4"
+	if dir == "." || dir == "/" {
+		return outName
+	}
+	return path.Join(dir, outName)
+}
+
+func findTranscodedSourceObjectKey(ctx context.Context, client *tos.ClientV2, bucket, prefix, inputKey, outputKey string, notBefore time.Time) (string, error) {
+	marker := ""
+	var bestKey string
+	var bestTime time.Time
+
+	for {
+		out, err := client.ListObjectsV2(ctx, &tos.ListObjectsV2Input{
+			Bucket: bucket,
+			ListObjectsInput: tos.ListObjectsInput{
+				Prefix:  prefix,
+				Marker:  marker,
+				MaxKeys: 1000,
+				Reverse: true,
+			},
+		})
+		if err != nil {
+			return "", err
+		}
+
+		for _, obj := range out.Contents {
+			key := obj.Key
+			if key == "" || key == inputKey || key == outputKey || strings.HasSuffix(key, "/") {
+				continue
+			}
+
+			lm, err := parseLastModified(obj.LastModified)
+			if err != nil {
+				continue
+			}
+			if lm.Before(notBefore) {
+				continue
+			}
+
+			if bestKey == "" || lm.After(bestTime) {
+				bestKey = key
+				bestTime = lm
+			}
+		}
+
+		if !out.IsTruncated || out.NextMarker == "" {
+			break
+		}
+		marker = out.NextMarker
+	}
+
+	if bestKey == "" {
+		return "", fmt.Errorf("未在TOS中找到转码产物对象")
+	}
+	return bestKey, nil
+}
+
+func renameObject(ctx context.Context, client *tos.ClientV2, bucket, srcKey, dstKey string) error {
+	_, err := client.CopyObject(ctx, &tos.CopyObjectInput{
+		Bucket:    bucket,
+		Key:       dstKey,
+		SrcBucket: bucket,
+		SrcKey:    srcKey,
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = client.DeleteObjectV2(ctx, &tos.DeleteObjectV2Input{
+		Bucket: bucket,
+		Key:    srcKey,
+	})
+	return err
+}
+
+func buildTosPresignedURL(tosCfg TOSConfig, bucket, objectKey string, expiresSeconds int64) (string, error) {
+	client, err := newTOSClient(tosCfg)
+	if err != nil {
+		return "", fmt.Errorf("初始化TOS客户端失败: %v", err)
+	}
+
+	resp, err := client.PreSignedURL(&tos.PreSignedURLInput{
+		HTTPMethod: enum.HttpMethodGet,
+		Bucket:     bucket,
+		Key:        strings.TrimPrefix(objectKey, "/"),
+		Expires:    expiresSeconds,
+	})
+	if err != nil {
+		return "", fmt.Errorf("生成预签名URL失败: %v", err)
+	}
+	if resp == nil || resp.SignedUrl == "" {
+		return "", fmt.Errorf("生成预签名URL失败: 返回为空")
+	}
+
+	return resp.SignedUrl, nil
+}
+
+func getTranscodedObjectLocation(config *Config, transcodeInfo *TranscodeInfo) (string, string, error) {
+	if transcodeInfo == nil {
+		return "", "", fmt.Errorf("转码信息为空")
+	}
+	storeUri := strings.TrimSpace(transcodeInfo.StoreUri)
+	if storeUri == "" {
+		return "", "", fmt.Errorf("StoreUri为空")
+	}
+
+	if strings.HasPrefix(storeUri, "http://") || strings.HasPrefix(storeUri, "https://") {
+		u, err := url.Parse(storeUri)
+		if err != nil {
+			return "", "", fmt.Errorf("解析StoreUri失败: %v", err)
+		}
+		host := u.Hostname()
+		objectKey := strings.TrimPrefix(u.Path, "/")
+		if host == "" || objectKey == "" {
+			return "", "", fmt.Errorf("StoreUri缺少主机或路径")
+		}
+		parts := strings.Split(host, ".")
+		bucket := parts[0]
+		return bucket, objectKey, nil
+	}
+
+	storeUri = strings.TrimPrefix(storeUri, "tos://")
+	storeUri = strings.TrimPrefix(storeUri, "/")
+	parts := strings.SplitN(storeUri, "/", 2)
+	if len(parts) == 1 {
+		if config != nil {
+			return config.TOS.BucketName, parts[0], nil
+		}
+		return "", parts[0], nil
+	}
+
+	if config != nil {
+		if parts[0] == config.TOS.BucketName || strings.HasPrefix(parts[0], "tos-") {
+			return parts[0], strings.TrimPrefix(parts[1], "/"), nil
+		}
+		return config.TOS.BucketName, storeUri, nil
+	}
+
+	return parts[0], strings.TrimPrefix(parts[1], "/"), nil
+}
+
+func buildTosPublicURL(endpoint, bucket, objectKey string) (string, error) {
+	ep := strings.TrimSpace(endpoint)
+	if ep == "" {
+		return "", fmt.Errorf("endpoint为空")
+	}
+	if !strings.Contains(ep, "://") {
+		ep = "https://" + ep
+	}
+	u, err := url.Parse(ep)
+	if err != nil {
+		return "", err
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("endpoint不合法")
+	}
+
+	host := u.Host
+	if bucket != "" && !strings.HasPrefix(host, bucket+".") {
+		host = bucket + "." + host
+	}
+	u.Host = host
+	u.Path = "/" + strings.TrimPrefix(objectKey, "/")
+	return u.String(), nil
 }
 
 // 上传视频到TOS
@@ -241,28 +448,18 @@ func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, stri
 		if status == "0" {
 			fmt.Println("转码完成!")
 			vid = result.Vid
-			fmt.Printf("视频ID (Vid): %s\n", vid)
+			workflowVid, transcodeInfo, rErr := vodClient.GetWorkflowExecutionResult(runId)
+			if rErr != nil {
+				return "", status, nil, fmt.Errorf("获取工作流结果失败: %v", rErr)
+			}
+			if vid == "" {
+				vid = workflowVid
+			}
 			fmt.Printf("模板ID: %s\n", result.TemplateId)
 			fmt.Printf("模板名称: %s\n", result.TemplateName)
 			if result.EndTime != "" {
 				fmt.Printf("完成时间: %s\n", result.EndTime)
 			}
-
-			var transcodeInfo *TranscodeInfo
-			fmt.Println("尝试从执行结果获取转码信息...")
-			if resultVid, info, err := vodClient.GetWorkflowExecutionResult(runId); err == nil {
-				if vid == "" && resultVid != "" {
-					vid = resultVid
-					fmt.Printf("从执行结果获取到Vid: %s\n", vid)
-				}
-				transcodeInfo = info
-				if transcodeInfo != nil {
-					fmt.Println("从执行结果获取到转码信息")
-				}
-			} else {
-				fmt.Printf("从执行结果获取转码信息失败: %v\n", err)
-			}
-
 			fmt.Println()
 			return vid, status, transcodeInfo, nil
 		}
@@ -291,7 +488,7 @@ func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, stri
 }
 
 // 获取播放地址
-func getPlayInfo(vodClient VODClientInterface, vid, filePath string, transcodeInfo *TranscodeInfo) (string, *GetPlayInfoResponse, error) {
+func getPlayInfo(vodClient VODClientInterface, config *Config, vid, filePath string, transcodeInfo *TranscodeInfo) (string, *GetPlayInfoResponse, error) {
 	fmt.Println("=" + strings.Repeat("=", 60))
 	fmt.Println("步骤4: 获取播放地址")
 	fmt.Println("=" + strings.Repeat("=", 60))
@@ -299,24 +496,189 @@ func getPlayInfo(vodClient VODClientInterface, vid, filePath string, transcodeIn
 	var result *GetPlayInfoResponse
 	var err error
 
-	if vid != "" {
-		fmt.Printf("视频ID (Vid): %s\n", vid)
+	buildResultFromTranscode := func(playUrl string) *GetPlayInfoResponse {
+		width, height, bitrate := 1280, 720, 2000000
+		size := int64(0)
+		duration := float64(0)
+		format := "mp4"
+		if transcodeInfo != nil {
+			if transcodeInfo.Width > 0 {
+				width = transcodeInfo.Width
+			}
+			if transcodeInfo.Height > 0 {
+				height = transcodeInfo.Height
+			}
+			if transcodeInfo.Bitrate > 0 {
+				bitrate = transcodeInfo.Bitrate
+			}
+			if transcodeInfo.Size > 0 {
+				size = int64(transcodeInfo.Size)
+			}
+			if transcodeInfo.Duration > 0 {
+				duration = float64(transcodeInfo.Duration)
+			}
+			if transcodeInfo.Format != "" {
+				format = transcodeInfo.Format
+			}
+		}
+
+		return &GetPlayInfoResponse{
+			Vid:        vid,
+			Status:     10,
+			PosterUrl:  "",
+			Duration:   duration,
+			FileType:   "video",
+			TotalCount: 1,
+			PlayInfoList: []struct {
+				FileId        string `json:"FileId"`
+				FileType      string `json:"FileType"`
+				Definition    string `json:"Definition"`
+				Format        string `json:"Format"`
+				Codec         string `json:"Codec"`
+				MainPlayUrl   string `json:"MainPlayUrl"`
+				BackupPlayUrl string `json:"BackupPlayUrl"`
+				Bitrate       int    `json:"Bitrate"`
+				Width         int    `json:"Width"`
+				Height        int    `json:"Height"`
+				Size          int64  `json:"Size"`
+			}{
+				{
+					FileId:        "",
+					FileType:      "video",
+					Definition:    "720p",
+					Format:        format,
+					Codec:         "H264",
+					MainPlayUrl:   playUrl,
+					BackupPlayUrl: "",
+					Bitrate:       bitrate,
+					Width:         width,
+					Height:        height,
+					Size:          size,
+				},
+			},
+		}
+	}
+
+	if transcodeInfo != nil && strings.TrimSpace(transcodeInfo.StoreUri) != "" {
+		ctx := context.Background()
+		client, cErr := newTOSClient(config.TOS)
+		if cErr != nil {
+			return "", nil, fmt.Errorf("初始化TOS客户端失败: %v", cErr)
+		}
+
+		bucket := config.TOS.BucketName
+		outputKey := buildTranscodedOutputKey(filePath)
+
+		fmt.Printf("转码产物StoreUri: %s\n", transcodeInfo.StoreUri)
+		parsedBucket, srcKey, locErr := getTranscodedObjectLocation(config, transcodeInfo)
+		if locErr != nil {
+			return "", nil, fmt.Errorf("解析转码产物位置失败: %v", locErr)
+		}
+		if parsedBucket != "" {
+			bucket = parsedBucket
+		}
+		if strings.TrimSpace(srcKey) == "" {
+			return "", nil, fmt.Errorf("转码产物对象Key为空")
+		}
+		if srcKey != outputKey {
+			if rErr := renameObject(ctx, client, bucket, srcKey, outputKey); rErr != nil {
+				if strings.Contains(rErr.Error(), "does not exist") {
+					fmt.Printf("重命名对象跳过: %v\n", rErr)
+				} else {
+					return "", nil, fmt.Errorf("重命名对象失败: %v", rErr)
+				}
+			}
+		}
+
+		playUrl, urlErr := buildTosPresignedURL(config.TOS, bucket, outputKey, 3600)
+		if urlErr != nil {
+			publicUrl, publicErr := buildTosPublicURL(config.TOS.Endpoint, bucket, outputKey)
+			if publicErr != nil {
+				return "", nil, fmt.Errorf("生成TOS播放地址失败: %v", urlErr)
+			}
+			playUrl = publicUrl
+		}
+		result = buildResultFromTranscode(playUrl)
+		err = nil
+	}
+
+	if result == nil {
+		ctx := context.Background()
+		client, cErr := newTOSClient(config.TOS)
+		if cErr != nil {
+			return "", nil, fmt.Errorf("初始化TOS客户端失败: %v", cErr)
+		}
+
+		bucket := config.TOS.BucketName
+		outputKey := buildTranscodedOutputKey(filePath)
+		prefixCandidates := make([]string, 0, 3)
+		if p := path.Dir(filePath); p != "." && p != "/" {
+			if !strings.HasSuffix(p, "/") {
+				p += "/"
+			}
+			prefixCandidates = append(prefixCandidates, p)
+		}
+		if p := strings.TrimSpace(config.Video.OutputKeyPrefix); p != "" {
+			if !strings.HasSuffix(p, "/") {
+				p += "/"
+			}
+			prefixCandidates = append(prefixCandidates, p)
+		}
+		prefixCandidates = append(prefixCandidates, "")
+
+		notBefore := time.Now().Add(-2 * time.Hour)
+		var lastErr error
+		for attempt := 1; attempt <= 6 && result == nil; attempt++ {
+			for _, prefix := range prefixCandidates {
+				srcKey, fErr := findTranscodedSourceObjectKey(ctx, client, bucket, prefix, filePath, outputKey, notBefore)
+				if fErr != nil {
+					lastErr = fErr
+					continue
+				}
+				if srcKey != outputKey {
+					if rErr := renameObject(ctx, client, bucket, srcKey, outputKey); rErr != nil {
+						return "", nil, fmt.Errorf("重命名对象失败: %v", rErr)
+					}
+				}
+
+				playUrl, urlErr := buildTosPresignedURL(config.TOS, bucket, outputKey, 3600)
+				if urlErr != nil {
+					publicUrl, publicErr := buildTosPublicURL(config.TOS.Endpoint, bucket, outputKey)
+					if publicErr != nil {
+						return "", nil, fmt.Errorf("生成TOS播放地址失败: %v", urlErr)
+					}
+					playUrl = publicUrl
+				}
+				result = buildResultFromTranscode(playUrl)
+				err = nil
+				break
+			}
+			if result != nil {
+				break
+			}
+			if attempt < 6 {
+				fmt.Printf("未定位到转码产物，等待5秒后重试（%d/6）...\n", attempt)
+				time.Sleep(5 * time.Second)
+			}
+		}
+		if result == nil && lastErr != nil {
+			fmt.Printf("定位转码产物失败: %v\n", lastErr)
+		}
+	}
+
+	if result == nil && vid != "" {
 		fmt.Printf("请求格式: mp4\n")
 		fmt.Printf("请求清晰度: 720p\n")
 		fmt.Println("正在通过Vid获取播放地址...")
 
 		result, err = vodClient.GetPlayInfo(vid, "mp4", "720p")
-	} else {
-		fmt.Println("未获取到Vid，正在通过文件路径获取播放地址...")
+		if err != nil {
+			return "", nil, fmt.Errorf("获取播放地址失败: %v", err)
+		}
+	} else if result == nil {
+		fmt.Println("未获取到转码产物信息，无法获取播放地址")
 		fmt.Printf("文件路径: %s\n", filePath)
-		fmt.Printf("请求格式: mp4\n")
-		fmt.Printf("请求清晰度: 720p\n")
-
-		result, err = vodClient.GetPlayInfoByFilePath(filePath, "mp4", "720p", transcodeInfo)
-	}
-
-	if err != nil {
-		return "", nil, fmt.Errorf("获取播放地址失败: %v", err)
+		return "", nil, fmt.Errorf("未获取到转码产物信息")
 	}
 
 	if result.Status != 10 {
@@ -441,7 +803,7 @@ func main() {
 
 	// 步骤4: 获取播放地址
 	// 如果Vid为空，尝试通过文件路径获取播放地址
-	playUrl, playInfo, err := getPlayInfo(vodClient, vid, objectKey, transcodeInfo)
+	playUrl, playInfo, err := getPlayInfo(vodClient, config, vid, objectKey, transcodeInfo)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "获取播放地址失败: %v\n", err)
 		os.Exit(1)
@@ -453,7 +815,6 @@ func main() {
 	fmt.Println("=" + strings.Repeat("=", 60))
 	fmt.Println("Demo执行完成!")
 	fmt.Println("=" + strings.Repeat("=", 60))
-	fmt.Printf("视频ID (Vid): %s\n", vid)
 	fmt.Printf("播放地址: %s\n", playUrl)
 	fmt.Println()
 	fmt.Println("您可以使用以下方式播放视频:")

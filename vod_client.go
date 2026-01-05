@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/volcengine/volc-sdk-golang/base"
@@ -196,36 +197,61 @@ func (c *VODClient) GetWorkflowExecutionResult(runId string) (string, *Transcode
 	// 从结果中获取Vid
 	vid := output.Result.Vid
 
-	// 从转码信息中获取第一个720p的转码结果
 	var transcodeInfo *TranscodeInfo
 	if output.Result.TranscodeInfos != nil && len(output.Result.TranscodeInfos) > 0 {
+		bestScore := -1
+		var bestStoreUri string
+		var bestFormat string
+		var bestDuration float32
+		var bestSize float64
+		var bestWidth int
+		var bestHeight int
+		var bestBitrate int
+
 		for _, info := range output.Result.TranscodeInfos {
-			// 检查是否是视频文件且清晰度为720p
-			if info.FileType == "video" && info.Format == "mp4" {
-				// 从视频流信息中获取分辨率
-				width, height := 0, 0
-				if info.VideoStreamMeta != nil {
-					width = int(info.VideoStreamMeta.Width)
-					height = int(info.VideoStreamMeta.Height)
-				}
+			storeUri := strings.TrimSpace(info.StoreUri)
+			if storeUri == "" {
+				continue
+			}
 
-				// 从视频流信息中获取码率
-				bitrate := 0
-				if info.VideoStreamMeta != nil {
-					bitrate = int(info.VideoStreamMeta.Bitrate)
-				}
+			score := 0
+			if strings.EqualFold(info.FileType, "video") {
+				score += 10
+			}
+			if strings.EqualFold(info.Format, "mp4") {
+				score += 5
+			}
+			if info.VideoStreamMeta != nil {
+				score += 1
+			}
 
-				// 创建转码信息
-				transcodeInfo = &TranscodeInfo{
-					StoreUri: info.StoreUri,
-					Format:   info.Format,
-					Duration: info.Duration,
-					Size:     info.Size,
-					Width:    width,
-					Height:   height,
-					Bitrate:  bitrate,
+			if score > bestScore {
+				bestScore = score
+				bestStoreUri = storeUri
+				bestFormat = info.Format
+				bestDuration = info.Duration
+				bestSize = info.Size
+				if info.VideoStreamMeta != nil {
+					bestWidth = int(info.VideoStreamMeta.Width)
+					bestHeight = int(info.VideoStreamMeta.Height)
+					bestBitrate = int(info.VideoStreamMeta.Bitrate)
+				} else {
+					bestWidth = 0
+					bestHeight = 0
+					bestBitrate = 0
 				}
-				break
+			}
+		}
+
+		if bestScore >= 0 {
+			transcodeInfo = &TranscodeInfo{
+				StoreUri: bestStoreUri,
+				Format:   bestFormat,
+				Duration: bestDuration,
+				Size:     bestSize,
+				Width:    bestWidth,
+				Height:   bestHeight,
+				Bitrate:  bestBitrate,
 			}
 		}
 	}

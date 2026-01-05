@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/volcengine/ve-tos-golang-sdk/v2/tos"
 	"github.com/volcengine/ve-tos-golang-sdk/v2/tos/enum"
@@ -66,6 +67,16 @@ func loadEnvFile(envPath string) error {
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
+			if value != "" && value[0] != '\'' && value[0] != '"' {
+				for i, r := range value {
+					if r == '#' {
+						if i > 0 && unicode.IsSpace(rune(value[i-1])) {
+							value = strings.TrimSpace(value[:i-1])
+						}
+						break
+					}
+				}
+			}
 			// 移除引号（如果有）
 			value = strings.Trim(value, `"'`)
 			os.Setenv(key, value)
@@ -136,7 +147,7 @@ func parseLastModified(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("无法解析LastModified: %s", value)
 }
 
-func buildTranscodedOutputKey(inputObjectKey string) string {
+func buildTranscodedOutputKey(inputObjectKey string, transcodeInfo *TranscodeInfo) string {
 	dir := path.Dir(inputObjectKey)
 	base := path.Base(inputObjectKey)
 	ext := path.Ext(base)
@@ -145,7 +156,20 @@ func buildTranscodedOutputKey(inputObjectKey string) string {
 		stem = base
 	}
 
-	outName := stem + "-转码后-720P.mp4"
+	label := "720P"
+	if transcodeInfo != nil {
+		dim := transcodeInfo.Height
+		if transcodeInfo.Width > 0 && transcodeInfo.Height > 0 {
+			if transcodeInfo.Width < transcodeInfo.Height {
+				dim = transcodeInfo.Width
+			}
+		}
+		if dim > 0 {
+			label = fmt.Sprintf("%dP", dim)
+		}
+	}
+
+	outName := stem + "-转码后-" + label + ".mp4"
 	if dir == "." || dir == "/" {
 		return outName
 	}
@@ -313,44 +337,40 @@ func buildTosPublicURL(endpoint, bucket, objectKey string) (string, error) {
 }
 
 // 上传视频到TOS
-func uploadVideoToTOS(config *Config) (string, error) {
+func uploadVideoToTOS(config *Config, inputPath string) (string, int64, time.Duration, error) {
 	fmt.Println("=" + strings.Repeat("=", 60))
 	fmt.Println("步骤1: 上传视频到TOS桶")
 	fmt.Println("=" + strings.Repeat("=", 60))
 
 	// 检查文件是否存在
-	if _, err := os.Stat(config.Video.InputPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("视频文件不存在: %s", config.Video.InputPath)
+	if _, err := os.Stat(inputPath); os.IsNotExist(err) {
+		return "", 0, 0, fmt.Errorf("视频文件不存在: %s", inputPath)
 	}
 
 	// 获取文件信息
-	fileInfo, err := os.Stat(config.Video.InputPath)
+	fileInfo, err := os.Stat(inputPath)
 	if err != nil {
-		return "", fmt.Errorf("获取文件信息失败: %v", err)
+		return "", 0, 0, fmt.Errorf("获取文件信息失败: %v", err)
 	}
 	fileSize := fileInfo.Size()
-	fmt.Printf("文件路径: %s\n", config.Video.InputPath)
+	fmt.Printf("文件路径: %s\n", inputPath)
 	fmt.Printf("文件大小: %.2f MB\n", float64(fileSize)/(1024*1024))
 
 	// 生成对象key
-	fileName := filepath.Base(config.Video.InputPath)
+	fileName := filepath.Base(inputPath)
 	objectKey := config.Video.OutputKeyPrefix + fileName
 	fmt.Printf("对象Key: %s\n", objectKey)
 
 	// 初始化TOS客户端
-	client, err := tos.NewClientV2(
-		config.TOS.Endpoint,
-		tos.WithRegion(config.TOS.Region),
-		tos.WithCredentials(tos.NewStaticCredentials(config.TOS.AccessKey, config.TOS.SecretKey)),
-	)
+	client, err := newTOSClient(config.TOS)
 	if err != nil {
-		return "", fmt.Errorf("初始化TOS客户端失败: %v", err)
+		return "", 0, 0, fmt.Errorf("初始化TOS客户端失败: %v", err)
 	}
 
 	// 打开文件
-	file, err := os.Open(config.Video.InputPath)
+	file, err := os.Open(inputPath)
 	if err != nil {
-		return "", fmt.Errorf("打开文件失败: %v", err)
+		return "", 0, 0, fmt.Errorf("打开文件失败: %v", err)
 	}
 	defer file.Close()
 
@@ -366,7 +386,7 @@ func uploadVideoToTOS(config *Config) (string, error) {
 		Content: file,
 	})
 	if err != nil {
-		return "", fmt.Errorf("上传文件失败: %v", err)
+		return "", 0, 0, fmt.Errorf("上传文件失败: %v", err)
 	}
 
 	uploadDuration := time.Since(startTime)
@@ -378,7 +398,38 @@ func uploadVideoToTOS(config *Config) (string, error) {
 	fmt.Printf("上传速度: %.2f MB/s\n", uploadSpeed)
 	fmt.Println()
 
-	return objectKey, nil
+	return objectKey, fileSize, uploadDuration, nil
+}
+
+func listVideoFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	allowed := map[string]struct{}{
+		".mp4":  {},
+		".mov":  {},
+		".mkv":  {},
+		".avi":  {},
+		".m4v":  {},
+		".flv":  {},
+		".webm": {},
+	}
+
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if _, ok := allowed[ext]; !ok {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir, entry.Name()))
+	}
+
+	return paths, nil
 }
 
 // 触发工作流转码
@@ -501,12 +552,20 @@ func getPlayInfo(vodClient VODClientInterface, config *Config, vid, filePath str
 		size := int64(0)
 		duration := float64(0)
 		format := "mp4"
+		definition := "720p"
 		if transcodeInfo != nil {
 			if transcodeInfo.Width > 0 {
 				width = transcodeInfo.Width
 			}
 			if transcodeInfo.Height > 0 {
 				height = transcodeInfo.Height
+				dim := transcodeInfo.Height
+				if transcodeInfo.Width > 0 && transcodeInfo.Height > 0 {
+					if transcodeInfo.Width < transcodeInfo.Height {
+						dim = transcodeInfo.Width
+					}
+				}
+				definition = fmt.Sprintf("%dp", dim)
 			}
 			if transcodeInfo.Bitrate > 0 {
 				bitrate = transcodeInfo.Bitrate
@@ -545,7 +604,7 @@ func getPlayInfo(vodClient VODClientInterface, config *Config, vid, filePath str
 				{
 					FileId:        "",
 					FileType:      "video",
-					Definition:    "720p",
+					Definition:    definition,
 					Format:        format,
 					Codec:         "H264",
 					MainPlayUrl:   playUrl,
@@ -567,7 +626,7 @@ func getPlayInfo(vodClient VODClientInterface, config *Config, vid, filePath str
 		}
 
 		bucket := config.TOS.BucketName
-		outputKey := buildTranscodedOutputKey(filePath)
+		outputKey := buildTranscodedOutputKey(filePath, transcodeInfo)
 
 		fmt.Printf("转码产物StoreUri: %s\n", transcodeInfo.StoreUri)
 		parsedBucket, srcKey, locErr := getTranscodedObjectLocation(config, transcodeInfo)
@@ -610,7 +669,7 @@ func getPlayInfo(vodClient VODClientInterface, config *Config, vid, filePath str
 		}
 
 		bucket := config.TOS.BucketName
-		outputKey := buildTranscodedOutputKey(filePath)
+		outputKey := buildTranscodedOutputKey(filePath, transcodeInfo)
 		prefixCandidates := make([]string, 0, 3)
 		if p := path.Dir(filePath); p != "." && p != "/" {
 			if !strings.HasSuffix(p, "/") {
@@ -768,58 +827,81 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 步骤1: 上传视频到TOS
-	startTime := time.Now()
-	objectKey, err := uploadVideoToTOS(config)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "上传失败: %v\n", err)
-		os.Exit(1)
-	}
-	uploadDuration := time.Since(startTime)
-
-	// 获取文件大小用于测试结果
-	fileInfo, _ := os.Stat(config.Video.InputPath)
-	fileSize := fileInfo.Size()
-
-	// 步骤2: 触发转码工作流
-	fmt.Println("\n注意: 如果遇到签名错误，建议使用火山引擎官方VOD SDK\n参考: https://www.volcengine.com/docs/4/3479")
-
-	runId, err := startWorkflow(vodClient, config, objectKey)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "\n触发工作流失败: %v\n", err)
-		fmt.Fprintf(os.Stderr, "\n提示: 如果遇到签名认证错误，请考虑:\n")
-		fmt.Fprintf(os.Stderr, "1. 使用火山引擎官方VOD SDK\n")
-		fmt.Fprintf(os.Stderr, "2. 检查AccessKey和SecretKey是否正确\n")
-		fmt.Fprintf(os.Stderr, "3. 参考官方文档: https://www.volcengine.com/docs/4/3479\n\n")
-		os.Exit(1)
+	inputDir := filepath.Dir(config.Video.InputPath)
+	if st, err := os.Stat(config.Video.InputPath); err == nil && st.IsDir() {
+		inputDir = config.Video.InputPath
 	}
 
-	// 步骤3: 查询转码状态
-	vid, _, transcodeInfo, err := getWorkflowStatus(vodClient, runId)
+	videoFiles, err := listVideoFiles(inputDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "查询转码状态失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "读取目录失败: %v\n", err)
 		os.Exit(1)
 	}
-
-	// 步骤4: 获取播放地址
-	// 如果Vid为空，尝试通过文件路径获取播放地址
-	playUrl, playInfo, err := getPlayInfo(vodClient, config, vid, objectKey, transcodeInfo)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "获取播放地址失败: %v\n", err)
-		os.Exit(1)
+	if len(videoFiles) == 0 {
+		fmt.Printf("目录下未找到可处理的视频文件: %s\n", inputDir)
+		return
 	}
 
-	// 显示测试结果
-	displayTestResults(config, uploadDuration, fileSize, playInfo)
+	results := make([]struct {
+		LocalPath string
+		PlayURL   string
+	}, 0, len(videoFiles))
 
-	fmt.Println("=" + strings.Repeat("=", 60))
-	fmt.Println("Demo执行完成!")
-	fmt.Println("=" + strings.Repeat("=", 60))
-	fmt.Printf("播放地址: %s\n", playUrl)
-	fmt.Println()
-	fmt.Println("您可以使用以下方式播放视频:")
-	fmt.Printf("1. 浏览器直接访问: %s\n", playUrl)
-	fmt.Println("2. 使用HTML5 video标签:")
-	fmt.Printf("   <video controls><source src=\"%s\" type=\"video/mp4\"></video>\n", playUrl)
-	fmt.Println()
+	for idx, inputPath := range videoFiles {
+		fmt.Println("=" + strings.Repeat("=", 60))
+		fmt.Printf("处理文件(%d/%d): %s\n", idx+1, len(videoFiles), inputPath)
+		fmt.Println("=" + strings.Repeat("=", 60))
+		fmt.Println()
+
+		objectKey, fileSize, uploadDuration, err := uploadVideoToTOS(config, inputPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "上传失败: %v\n", err)
+			continue
+		}
+
+		fmt.Println("\n注意: 如果遇到签名错误，建议使用火山引擎官方VOD SDK\n参考: https://www.volcengine.com/docs/4/3479")
+		runId, err := startWorkflow(vodClient, config, objectKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\n触发工作流失败: %v\n", err)
+			fmt.Fprintf(os.Stderr, "\n提示: 如果遇到签名认证错误，请考虑:\n")
+			fmt.Fprintf(os.Stderr, "1. 使用火山引擎官方VOD SDK\n")
+			fmt.Fprintf(os.Stderr, "2. 检查AccessKey和SecretKey是否正确\n")
+			fmt.Fprintf(os.Stderr, "3. 参考官方文档: https://www.volcengine.com/docs/4/3479\n\n")
+			continue
+		}
+
+		vid, _, transcodeInfo, err := getWorkflowStatus(vodClient, runId)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "查询转码状态失败: %v\n", err)
+			continue
+		}
+
+		playUrl, playInfo, err := getPlayInfo(vodClient, config, vid, objectKey, transcodeInfo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "获取播放地址失败: %v\n", err)
+			continue
+		}
+
+		displayTestResults(config, uploadDuration, fileSize, playInfo)
+
+		fmt.Println("=" + strings.Repeat("=", 60))
+		fmt.Println("本文件处理完成!")
+		fmt.Println("=" + strings.Repeat("=", 60))
+		fmt.Printf("播放地址: %s\n", playUrl)
+		fmt.Println()
+
+		results = append(results, struct {
+			LocalPath string
+			PlayURL   string
+		}{LocalPath: inputPath, PlayURL: playUrl})
+	}
+
+	if len(results) > 0 {
+		fmt.Println("=" + strings.Repeat("=", 60))
+		fmt.Println("批量处理结果汇总")
+		fmt.Println("=" + strings.Repeat("=", 60))
+		for _, item := range results {
+			fmt.Printf("%s\n%s\n\n", item.LocalPath, item.PlayURL)
+		}
+	}
 }

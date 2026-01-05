@@ -4,8 +4,6 @@
 *.dll
 *.so
 *.dylib
-demo
-dji-vod-demo
 
 # Test binary
 *.test
@@ -44,7 +42,7 @@ tmp/
 temp/
 
 # Video files (too large for GitHub)
-video/*.mp4
-video/*.mov
-video/*.avi
+# video/*.mp4
+# video/*.mov
+# video/*.avi
 

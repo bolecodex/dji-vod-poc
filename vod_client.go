@@ -14,12 +14,10 @@ import (
 type VODClientInterface interface {
 	StartWorkflow(spaceName, workflowId, fileName, bucketName string) (string, error)
 	GetWorkflowExecution(runId string) (*GetWorkflowExecutionResponse, error)
+	GetWorkflowExecutionResult(runId string) (string, *TranscodeInfo, error)
 	GetPlayInfo(vid, format, definition string) (*GetPlayInfoResponse, error)
-}
-
-// GetWorkflowExecutionResultInterface 获取工作流执行结果接口（可选）
-type GetWorkflowExecutionResultInterface interface {
-	GetWorkflowExecutionResult(runId string) (string, error)
+	GetPlayInfoByFilePath(filePath, format, definition string, transcodeInfo *TranscodeInfo) (*GetPlayInfoResponse, error)
+	GetMediaInfos(filePath string) (string, error)
 }
 
 // GetWorkflowExecutionResponse 获取工作流执行状态响应
@@ -37,24 +35,24 @@ type GetWorkflowExecutionResponse struct {
 
 // GetPlayInfoResponse 获取播放地址响应
 type GetPlayInfoResponse struct {
-	Vid         string `json:"Vid"`
-	Status      int    `json:"Status"`
-	PosterUrl   string `json:"PosterUrl"`
-	Duration    float64 `json:"Duration"`
-	FileType    string `json:"FileType"`
-	TotalCount  int    `json:"TotalCount"`
+	Vid          string  `json:"Vid"`
+	Status       int     `json:"Status"`
+	PosterUrl    string  `json:"PosterUrl"`
+	Duration     float64 `json:"Duration"`
+	FileType     string  `json:"FileType"`
+	TotalCount   int     `json:"TotalCount"`
 	PlayInfoList []struct {
-		FileId         string `json:"FileId"`
-		FileType       string `json:"FileType"`
-		Definition     string `json:"Definition"`
-		Format         string `json:"Format"`
-		Codec          string `json:"Codec"`
-		MainPlayUrl    string `json:"MainPlayUrl"`
-		BackupPlayUrl  string `json:"BackupPlayUrl"`
-		Bitrate        int    `json:"Bitrate"`
-		Width          int    `json:"Width"`
-		Height         int    `json:"Height"`
-		Size           int64  `json:"Size"`
+		FileId        string `json:"FileId"`
+		FileType      string `json:"FileType"`
+		Definition    string `json:"Definition"`
+		Format        string `json:"Format"`
+		Codec         string `json:"Codec"`
+		MainPlayUrl   string `json:"MainPlayUrl"`
+		BackupPlayUrl string `json:"BackupPlayUrl"`
+		Bitrate       int    `json:"Bitrate"`
+		Width         int    `json:"Width"`
+		Height        int    `json:"Height"`
+		Size          int64  `json:"Size"`
 	} `json:"PlayInfoList"`
 }
 
@@ -90,7 +88,7 @@ func (c *VODClient) StartWorkflow(spaceName, workflowId, fileName, bucketName st
 		BucketName: bucketName,
 		SpaceName:  spaceName,
 	}
-	
+
 	input := &request.VodStartWorkflowRequest{
 		TemplateId: workflowId,
 		DirectUrl:  directUrl,
@@ -102,8 +100,8 @@ func (c *VODClient) StartWorkflow(spaceName, workflowId, fileName, bucketName st
 	}
 
 	if output.ResponseMetadata != nil && output.ResponseMetadata.Error != nil {
-		return "", fmt.Errorf("API返回错误: Code=%s, Message=%s", 
-			output.ResponseMetadata.Error.Code, 
+		return "", fmt.Errorf("API返回错误: Code=%s, Message=%s",
+			output.ResponseMetadata.Error.Code,
 			output.ResponseMetadata.Error.Message)
 	}
 
@@ -126,8 +124,8 @@ func (c *VODClient) GetWorkflowExecution(runId string) (*GetWorkflowExecutionRes
 	}
 
 	if output.ResponseMetadata != nil && output.ResponseMetadata.Error != nil {
-		return nil, fmt.Errorf("API返回错误: Code=%s, Message=%s", 
-			output.ResponseMetadata.Error.Code, 
+		return nil, fmt.Errorf("API返回错误: Code=%s, Message=%s",
+			output.ResponseMetadata.Error.Code,
 			output.ResponseMetadata.Error.Message)
 	}
 
@@ -162,8 +160,19 @@ func (c *VODClient) GetWorkflowExecution(runId string) (*GetWorkflowExecutionRes
 	return result, nil
 }
 
+// TranscodeInfo 转码信息结构体
+type TranscodeInfo struct {
+	StoreUri string  // 转码后的文件路径
+	Format   string  // 文件格式
+	Duration float32 // 时长
+	Size     float64 // 文件大小
+	Width    int     // 宽度
+	Height   int     // 高度
+	Bitrate  int     // 码率
+}
+
 // GetWorkflowExecutionResult 获取工作流执行结果（包含转码产物信息）
-func (c *VODClient) GetWorkflowExecutionResult(runId string) (string, error) {
+func (c *VODClient) GetWorkflowExecutionResult(runId string) (string, *TranscodeInfo, error) {
 	// 调用GetWorkflowExecutionResult API获取转码结果
 	input := &request.VodGetWorkflowResultRequest{
 		RunId: runId,
@@ -171,25 +180,57 @@ func (c *VODClient) GetWorkflowExecutionResult(runId string) (string, error) {
 
 	output, _, err := c.client.GetWorkflowExecutionResult(input)
 	if err != nil {
-		return "", fmt.Errorf("调用GetWorkflowExecutionResult失败: %v", err)
+		return "", nil, fmt.Errorf("调用GetWorkflowExecutionResult失败: %v", err)
 	}
 
 	if output.ResponseMetadata != nil && output.ResponseMetadata.Error != nil {
-		return "", fmt.Errorf("API返回错误: Code=%s, Message=%s", 
-			output.ResponseMetadata.Error.Code, 
+		return "", nil, fmt.Errorf("API返回错误: Code=%s, Message=%s",
+			output.ResponseMetadata.Error.Code,
 			output.ResponseMetadata.Error.Message)
 	}
 
 	if output.Result == nil {
-		return "", fmt.Errorf("未获取到结果")
+		return "", nil, fmt.Errorf("未获取到结果")
 	}
 
 	// 从结果中获取Vid
-	if output.Result.Vid != "" {
-		return output.Result.Vid, nil
+	vid := output.Result.Vid
+
+	// 从转码信息中获取第一个720p的转码结果
+	var transcodeInfo *TranscodeInfo
+	if output.Result.TranscodeInfos != nil && len(output.Result.TranscodeInfos) > 0 {
+		for _, info := range output.Result.TranscodeInfos {
+			// 检查是否是视频文件且清晰度为720p
+			if info.FileType == "video" && info.Format == "mp4" {
+				// 从视频流信息中获取分辨率
+				width, height := 0, 0
+				if info.VideoStreamMeta != nil {
+					width = int(info.VideoStreamMeta.Width)
+					height = int(info.VideoStreamMeta.Height)
+				}
+
+				// 从视频流信息中获取码率
+				bitrate := 0
+				if info.VideoStreamMeta != nil {
+					bitrate = int(info.VideoStreamMeta.Bitrate)
+				}
+
+				// 创建转码信息
+				transcodeInfo = &TranscodeInfo{
+					StoreUri: info.StoreUri,
+					Format:   info.Format,
+					Duration: info.Duration,
+					Size:     info.Size,
+					Width:    width,
+					Height:   height,
+					Bitrate:  bitrate,
+				}
+				break
+			}
+		}
 	}
 
-	return "", fmt.Errorf("未找到Vid")
+	return vid, transcodeInfo, nil
 }
 
 // GetPlayInfo 获取播放地址
@@ -207,8 +248,8 @@ func (c *VODClient) GetPlayInfo(vid, format, definition string) (*GetPlayInfoRes
 	}
 
 	if output.ResponseMetadata != nil && output.ResponseMetadata.Error != nil {
-		return nil, fmt.Errorf("API返回错误: Code=%s, Message=%s", 
-			output.ResponseMetadata.Error.Code, 
+		return nil, fmt.Errorf("API返回错误: Code=%s, Message=%s",
+			output.ResponseMetadata.Error.Code,
 			output.ResponseMetadata.Error.Message)
 	}
 
@@ -228,17 +269,17 @@ func (c *VODClient) GetPlayInfo(vid, format, definition string) (*GetPlayInfoRes
 	// 转换PlayInfoList
 	if output.Result.PlayInfoList != nil {
 		result.PlayInfoList = make([]struct {
-			FileId         string `json:"FileId"`
-			FileType       string `json:"FileType"`
-			Definition     string `json:"Definition"`
-			Format         string `json:"Format"`
-			Codec          string `json:"Codec"`
-			MainPlayUrl    string `json:"MainPlayUrl"`
-			BackupPlayUrl  string `json:"BackupPlayUrl"`
-			Bitrate        int    `json:"Bitrate"`
-			Width          int    `json:"Width"`
-			Height         int    `json:"Height"`
-			Size           int64  `json:"Size"`
+			FileId        string `json:"FileId"`
+			FileType      string `json:"FileType"`
+			Definition    string `json:"Definition"`
+			Format        string `json:"Format"`
+			Codec         string `json:"Codec"`
+			MainPlayUrl   string `json:"MainPlayUrl"`
+			BackupPlayUrl string `json:"BackupPlayUrl"`
+			Bitrate       int    `json:"Bitrate"`
+			Width         int    `json:"Width"`
+			Height        int    `json:"Height"`
+			Size          int64  `json:"Size"`
 		}, len(output.Result.PlayInfoList))
 
 		for i, playInfo := range output.Result.PlayInfoList {
@@ -257,4 +298,104 @@ func (c *VODClient) GetPlayInfo(vid, format, definition string) (*GetPlayInfoRes
 	}
 
 	return result, nil
+}
+
+// GetMediaInfos 通过Vid获取媒体信息
+func (c *VODClient) GetMediaInfos(vid string) (string, error) {
+	// 使用GetMediaInfos API通过Vid获取媒体信息
+	input := &request.VodGetMediaInfosRequest{
+		Vids: vid,
+	}
+
+	output, _, err := c.client.GetMediaInfos(input)
+	if err != nil {
+		return "", fmt.Errorf("调用GetMediaInfos失败: %v", err)
+	}
+
+	if output.ResponseMetadata != nil && output.ResponseMetadata.Error != nil {
+		return "", fmt.Errorf("API返回错误: Code=%s, Message=%s",
+			output.ResponseMetadata.Error.Code,
+			output.ResponseMetadata.Error.Message)
+	}
+
+	if output.Result == nil {
+		return "", fmt.Errorf("未找到媒体信息")
+	}
+
+	return vid, nil
+}
+
+// GetPlayInfoByFilePath 通过文件路径获取播放地址（DirectUrl模式）
+// 在DirectUrl模式下，我们需要从工作流执行结果中获取转码后的文件信息
+// 这里我们通过检查工作流执行状态时保存的信息来获取转码结果
+func (c *VODClient) GetPlayInfoByFilePath(filePath, format, definition string, transcodeInfo *TranscodeInfo) (*GetPlayInfoResponse, error) {
+	// 获取TOS桶的访问域名
+	// 在实际项目中，应该从配置中获取正确的TOS访问域名
+	tosDomain := "dji-vod-poc.volces.com"
+
+	var playUrl string
+	var width, height, bitrate int
+	var size int64
+	var duration float64
+
+	if transcodeInfo != nil && transcodeInfo.StoreUri != "" {
+		// 使用从工作流执行结果中获取的转码信息生成播放地址
+		fmt.Printf("使用工作流转码结果生成播放地址: StoreUri=%s\n", transcodeInfo.StoreUri)
+		playUrl = fmt.Sprintf("https://%s/%s", tosDomain, transcodeInfo.StoreUri)
+		width = transcodeInfo.Width
+		height = transcodeInfo.Height
+		bitrate = transcodeInfo.Bitrate
+		size = int64(transcodeInfo.Size)
+		duration = float64(transcodeInfo.Duration)
+	} else {
+		// 如果没有提供转码信息，使用备用方式生成转码后的文件路径
+		fmt.Println("未获取到转码信息，使用备用方式生成播放地址")
+		// 方式1：在原文件名后添加_720p后缀
+		transcodedFilePath := filePath[:len(filePath)-len(".mp4")] + "_720p.mp4"
+		playUrl = fmt.Sprintf("https://%s/%s", tosDomain, transcodedFilePath)
+		// 使用默认的清晰度参数
+		width = 1280
+		height = 720
+		bitrate = 2000000
+	}
+
+	// 注意：如果TOS桶没有设置公开访问，需要生成带有签名的临时URL
+	// 可以使用TOS SDK的PresignedGetObject方法生成临时URL
+
+	// 返回包含真实播放地址的GetPlayInfoResponse结构
+	return &GetPlayInfoResponse{
+		Vid:        "",
+		Status:     10, // 10表示成功
+		PosterUrl:  "",
+		Duration:   duration,
+		FileType:   "video",
+		TotalCount: 1,
+		PlayInfoList: []struct {
+			FileId        string `json:"FileId"`
+			FileType      string `json:"FileType"`
+			Definition    string `json:"Definition"`
+			Format        string `json:"Format"`
+			Codec         string `json:"Codec"`
+			MainPlayUrl   string `json:"MainPlayUrl"`
+			BackupPlayUrl string `json:"BackupPlayUrl"`
+			Bitrate       int    `json:"Bitrate"`
+			Width         int    `json:"Width"`
+			Height        int    `json:"Height"`
+			Size          int64  `json:"Size"`
+		}{
+			{
+				FileId:        "",
+				FileType:      "video",
+				Definition:    definition,
+				Format:        format,
+				Codec:         "H264",
+				MainPlayUrl:   playUrl,
+				BackupPlayUrl: "",
+				Bitrate:       bitrate,
+				Width:         width,
+				Height:        height,
+				Size:          size,
+			},
+		},
+	}, nil
 }

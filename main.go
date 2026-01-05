@@ -15,33 +15,32 @@ import (
 
 // Config 配置结构
 type Config struct {
-	TOS  TOSConfig  `yaml:"tos"`
-	VOD  VODConfig  `yaml:"vod"`
+	TOS   TOSConfig   `yaml:"tos"`
+	VOD   VODConfig   `yaml:"vod"`
 	Video VideoConfig `yaml:"video"`
 }
 
 type TOSConfig struct {
-	AccessKey string `yaml:"access_key"`
-	SecretKey string `yaml:"secret_key"`
-	Endpoint  string `yaml:"endpoint"`
-	Region    string `yaml:"region"`
+	AccessKey  string `yaml:"access_key"`
+	SecretKey  string `yaml:"secret_key"`
+	Endpoint   string `yaml:"endpoint"`
+	Region     string `yaml:"region"`
 	BucketName string `yaml:"bucket_name"`
 }
 
 type VODConfig struct {
-	AccessKey  string `yaml:"access_key"`
-	SecretKey  string `yaml:"secret_key"`
-	Region     string `yaml:"region"`
-	SpaceName  string `yaml:"space_name"`
-	WorkflowID string `yaml:"workflow_id"`
+	AccessKey   string `yaml:"access_key"`
+	SecretKey   string `yaml:"secret_key"`
+	Region      string `yaml:"region"`
+	SpaceName   string `yaml:"space_name"`
+	WorkflowID  string `yaml:"workflow_id"`
 	APIEndpoint string `yaml:"api_endpoint"`
 }
 
 type VideoConfig struct {
-	InputPath      string `yaml:"input_path"`
+	InputPath       string `yaml:"input_path"`
 	OutputKeyPrefix string `yaml:"output_key_prefix"`
 }
-
 
 // loadEnvFile 加载.env文件
 func loadEnvFile(envPath string) error {
@@ -91,7 +90,7 @@ func loadConfig(configPath string) (*Config, error) {
 	// 如果TOS和VOD使用相同的AK/SK，优先使用统一的ACCESS_KEY和SECRET_KEY
 	accessKey := os.Getenv("ACCESS_KEY")
 	secretKey := os.Getenv("SECRET_KEY")
-	
+
 	// TOS配置
 	if envVal := os.Getenv("TOS_ACCESS_KEY"); envVal != "" {
 		config.TOS.AccessKey = envVal
@@ -103,7 +102,7 @@ func loadConfig(configPath string) (*Config, error) {
 	} else if secretKey != "" {
 		config.TOS.SecretKey = secretKey
 	}
-	
+
 	// VOD配置
 	if envVal := os.Getenv("VOD_ACCESS_KEY"); envVal != "" {
 		config.VOD.AccessKey = envVal
@@ -167,7 +166,7 @@ func uploadVideoToTOS(config *Config) (string, error) {
 	// 上传文件并记录时间
 	startTime := time.Now()
 	ctx := context.Background()
-	
+
 	output, err := client.PutObjectV2(ctx, &tos.PutObjectV2Input{
 		PutObjectBasicInput: tos.PutObjectBasicInput{
 			Bucket: config.TOS.BucketName,
@@ -224,19 +223,19 @@ func startWorkflow(vodClient VODClientInterface, config *Config, objectKey strin
 }
 
 // 查询工作流状态
-func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, string, error) {
+func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, string, *TranscodeInfo, error) {
 	fmt.Println("=" + strings.Repeat("=", 60))
 	fmt.Println("步骤3: 查询工作流执行状态")
 	fmt.Println("=" + strings.Repeat("=", 60))
 
 	// 轮询查询状态
-	maxRetries := 120 // 最多查询120次（20分钟）
+	maxRetries := 120                 // 最多查询120次（20分钟）
 	retryInterval := 10 * time.Second // 每10秒查询一次
 
 	var vid string
 	for i := 0; i < maxRetries; i++ {
 		fmt.Printf("第 %d 次查询状态...\n", i+1)
-		
+
 		result, err := vodClient.GetWorkflowExecution(runId)
 		if err != nil {
 			fmt.Printf("查询状态失败: %v，继续重试...\n", err)
@@ -264,24 +263,24 @@ func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, stri
 			if result.EndTime != "" {
 				fmt.Printf("完成时间: %s\n", result.EndTime)
 			}
-			
-			// 如果Vid为空，尝试从GetWorkflowExecutionResult获取
-			if vid == "" {
-				fmt.Println("Vid为空，尝试从执行结果获取...")
-				if clientV1, ok := vodClient.(interface {
-					GetWorkflowExecutionResult(runId string) (string, error)
-				}); ok {
-					if resultVid, err := clientV1.GetWorkflowExecutionResult(runId); err == nil {
-						vid = resultVid
-						fmt.Printf("从执行结果获取到Vid: %s\n", vid)
-					} else {
-						fmt.Printf("从执行结果获取Vid失败: %v\n", err)
-					}
+
+			var transcodeInfo *TranscodeInfo
+			fmt.Println("尝试从执行结果获取转码信息...")
+			if resultVid, info, err := vodClient.GetWorkflowExecutionResult(runId); err == nil {
+				if vid == "" && resultVid != "" {
+					vid = resultVid
+					fmt.Printf("从执行结果获取到Vid: %s\n", vid)
 				}
+				transcodeInfo = info
+				if transcodeInfo != nil {
+					fmt.Println("从执行结果获取到转码信息")
+				}
+			} else {
+				fmt.Printf("从执行结果获取转码信息失败: %v\n", err)
 			}
-			
+
 			fmt.Println()
-			return vid, status, nil
+			return vid, status, transcodeInfo, nil
 		}
 
 		if status == "PendingStart" || status == "Running" {
@@ -292,11 +291,11 @@ func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, stri
 
 		// 如果状态是失败
 		if strings.HasPrefix(status, "1") || strings.HasPrefix(status, "2") {
-			return "", status, fmt.Errorf("转码失败，状态码: %s", status)
+			return "", status, nil, fmt.Errorf("转码失败，状态码: %s", status)
 		}
 
 		if status == "Terminated" {
-			return "", status, fmt.Errorf("转码任务已终止")
+			return "", status, nil, fmt.Errorf("转码任务已终止")
 		}
 
 		// 未知状态，继续等待
@@ -304,21 +303,34 @@ func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, stri
 		time.Sleep(retryInterval)
 	}
 
-	return vid, "", fmt.Errorf("转码超时，超过最大重试次数 (%d 次)", maxRetries)
+	return vid, "", nil, fmt.Errorf("转码超时，超过最大重试次数 (%d 次)", maxRetries)
 }
 
 // 获取播放地址
-func getPlayInfo(vodClient VODClientInterface, vid string) (string, *GetPlayInfoResponse, error) {
+func getPlayInfo(vodClient VODClientInterface, vid, filePath string, transcodeInfo *TranscodeInfo) (string, *GetPlayInfoResponse, error) {
 	fmt.Println("=" + strings.Repeat("=", 60))
 	fmt.Println("步骤4: 获取播放地址")
 	fmt.Println("=" + strings.Repeat("=", 60))
 
-	fmt.Printf("视频ID (Vid): %s\n", vid)
-	fmt.Printf("请求格式: mp4\n")
-	fmt.Printf("请求清晰度: 720p\n")
-	fmt.Println("正在获取播放地址...")
+	var result *GetPlayInfoResponse
+	var err error
 
-	result, err := vodClient.GetPlayInfo(vid, "mp4", "720p")
+	if vid != "" {
+		fmt.Printf("视频ID (Vid): %s\n", vid)
+		fmt.Printf("请求格式: mp4\n")
+		fmt.Printf("请求清晰度: 720p\n")
+		fmt.Println("正在通过Vid获取播放地址...")
+
+		result, err = vodClient.GetPlayInfo(vid, "mp4", "720p")
+	} else {
+		fmt.Println("未获取到Vid，正在通过文件路径获取播放地址...")
+		fmt.Printf("文件路径: %s\n", filePath)
+		fmt.Printf("请求格式: mp4\n")
+		fmt.Printf("请求清晰度: 720p\n")
+
+		result, err = vodClient.GetPlayInfoByFilePath(filePath, "mp4", "720p", transcodeInfo)
+	}
+
 	if err != nil {
 		return "", nil, fmt.Errorf("获取播放地址失败: %v", err)
 	}
@@ -355,11 +367,11 @@ func displayTestResults(config *Config, uploadDuration time.Duration, fileSize i
 	fmt.Println("=" + strings.Repeat("=", 60))
 	fmt.Println("测试结果汇总")
 	fmt.Println("=" + strings.Repeat("=", 60))
-	
+
 	uploadSpeed := float64(fileSize) / uploadDuration.Seconds() / (1024 * 1024)
 	fmt.Printf("上传速度: %.2f MB/s\n", uploadSpeed)
 	fmt.Printf("上传耗时: %.2f 秒\n", uploadDuration.Seconds())
-	
+
 	if playInfo != nil && len(playInfo.PlayInfoList) > 0 {
 		transcodedSize := playInfo.PlayInfoList[0].Size
 		compressionRatio := float64(transcodedSize) / float64(fileSize) * 100
@@ -424,9 +436,8 @@ func main() {
 	fileSize := fileInfo.Size()
 
 	// 步骤2: 触发转码工作流
-	fmt.Println("\n注意: 如果遇到签名错误，建议使用火山引擎官方VOD SDK")
-	fmt.Println("参考: https://www.volcengine.com/docs/4/3479\n")
-	
+	fmt.Println("\n注意: 如果遇到签名错误，建议使用火山引擎官方VOD SDK\n参考: https://www.volcengine.com/docs/4/3479")
+
 	runId, err := startWorkflow(vodClient, config, objectKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n触发工作流失败: %v\n", err)
@@ -438,24 +449,15 @@ func main() {
 	}
 
 	// 步骤3: 查询转码状态
-	vid, _, err := getWorkflowStatus(vodClient, runId)
+	vid, _, transcodeInfo, err := getWorkflowStatus(vodClient, runId)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "查询转码状态失败: %v\n", err)
 		os.Exit(1)
 	}
 
 	// 步骤4: 获取播放地址
-	if vid == "" {
-		fmt.Fprintf(os.Stderr, "警告: 未获取到Vid，无法获取播放地址\n")
-		fmt.Fprintf(os.Stderr, "提示: DirectUrl模式下，可能需要通过其他方式获取Vid\n")
-		fmt.Fprintf(os.Stderr, "您可以:\n")
-		fmt.Fprintf(os.Stderr, "1. 检查工作流执行结果中的其他字段\n")
-		fmt.Fprintf(os.Stderr, "2. 通过TOS文件路径查询对应的Vid\n")
-		fmt.Fprintf(os.Stderr, "3. 使用控制台查看转码后的视频信息\n")
-		os.Exit(1)
-	}
-	
-	playUrl, playInfo, err := getPlayInfo(vodClient, vid)
+	// 如果Vid为空，尝试通过文件路径获取播放地址
+	playUrl, playInfo, err := getPlayInfo(vodClient, vid, objectKey, transcodeInfo)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "获取播放地址失败: %v\n", err)
 		os.Exit(1)
@@ -476,4 +478,3 @@ func main() {
 	fmt.Printf("   <video controls><source src=\"%s\" type=\"video/mp4\"></video>\n", playUrl)
 	fmt.Println()
 }
-

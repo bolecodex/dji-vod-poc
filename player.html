@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>视频播放器 - 大疆云相册Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .video-container {
+            margin: 20px 0;
+            text-align: center;
+        }
+        video {
+            width: 100%;
+            max-width: 800px;
+            height: auto;
+            border-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+        .info {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #f9f9f9;
+            border-radius: 4px;
+        }
+        .info-item {
+            margin: 10px 0;
+            padding: 8px;
+            border-bottom: 1px solid #eee;
+        }
+        .info-label {
+            font-weight: bold;
+            color: #666;
+            display: inline-block;
+            width: 150px;
+        }
+        .info-value {
+            color: #333;
+        }
+        .url-input {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .btn {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 10px 5px;
+        }
+        .btn:hover {
+            background-color: #0056b3;
+        }
+        .latency-test {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #e7f3ff;
+            border-radius: 4px;
+        }
+        .latency-result {
+            margin-top: 10px;
+            font-weight: bold;
+            color: #007bff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎬 视频播放器 - 大疆云相册Demo</h1>
+        
+        <div class="video-container">
+            <label for="videoUrl">播放地址:</label>
+            <input type="text" id="videoUrl" class="url-input" 
+                   placeholder="请输入或粘贴视频播放地址">
+            <button class="btn" onclick="loadVideo()">加载视频</button>
+            <button class="btn" onclick="testLatency()">测试播放时延</button>
+        </div>
+
+        <div class="video-container">
+            <video id="videoPlayer" controls preload="metadata">
+                您的浏览器不支持视频播放。
+            </video>
+        </div>
+
+        <div class="info">
+            <h3>视频信息</h3>
+            <div class="info-item">
+                <span class="info-label">视频ID (Vid):</span>
+                <span class="info-value" id="vid">-</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">格式:</span>
+                <span class="info-value" id="format">-</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">清晰度:</span>
+                <span class="info-value" id="definition">-</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">分辨率:</span>
+                <span class="info-value" id="resolution">-</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">码率:</span>
+                <span class="info-value" id="bitrate">-</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">文件大小:</span>
+                <span class="info-value" id="size">-</span>
+            </div>
+        </div>
+
+        <div class="latency-test">
+            <h3>播放时延测试</h3>
+            <p>点击"测试播放时延"按钮，将测量从点击播放到视频开始播放的时间。</p>
+            <div class="latency-result" id="latencyResult"></div>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('videoPlayer');
+        let latencyStartTime = null;
+
+        function loadVideo() {
+            const url = document.getElementById('videoUrl').value.trim();
+            if (!url) {
+                alert('请输入视频播放地址');
+                return;
+            }
+            
+            video.src = url;
+            video.load();
+            
+            // 更新视频信息（从URL或实际视频属性获取）
+            updateVideoInfo();
+        }
+
+        function updateVideoInfo() {
+            // 当视频元数据加载完成后更新信息
+            video.addEventListener('loadedmetadata', function() {
+                document.getElementById('resolution').textContent = 
+                    video.videoWidth + 'x' + video.videoHeight;
+            }, { once: true });
+        }
+
+        function testLatency() {
+            if (!video.src) {
+                alert('请先加载视频');
+                return;
+            }
+
+            const resultDiv = document.getElementById('latencyResult');
+            resultDiv.textContent = '测试中...';
+            
+            // 重置视频
+            video.currentTime = 0;
+            video.pause();
+            
+            // 记录开始时间
+            latencyStartTime = performance.now();
+            
+            // 开始播放
+            const playPromise = video.play();
+            
+            if (playPromise !== undefined) {
+                playPromise.then(() => {
+                    // 等待视频真正开始播放
+                    video.addEventListener('playing', function onPlaying() {
+                        const latency = performance.now() - latencyStartTime;
+                        resultDiv.textContent = `播放时延: ${latency.toFixed(2)} 毫秒`;
+                        video.removeEventListener('playing', onPlaying);
+                    }, { once: true });
+                }).catch(error => {
+                    resultDiv.textContent = '播放失败: ' + error.message;
+                });
+            }
+        }
+
+        // 从URL参数中获取播放地址（如果通过Demo传递）
+        window.addEventListener('DOMContentLoaded', function() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const playUrl = urlParams.get('url');
+            if (playUrl) {
+                document.getElementById('videoUrl').value = decodeURIComponent(playUrl);
+                loadVideo();
+            }
+        });
+    </script>
+</body>
+</html>
+

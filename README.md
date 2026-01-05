@@ -48,23 +48,15 @@ cp .env_example .env
 编辑 `.env` 文件：
 
 ```bash
-# 火山引擎统一配置（TOS和VOD使用相同的AK/SK）
+# 火山引擎统一配置（TOS和VOD共用一套AK/SK）
 ACCESS_KEY=your-access-key-here
 SECRET_KEY=your-secret-key-here
-
-# TOS配置（使用统一AK/SK）
-TOS_ACCESS_KEY=your-access-key-here
-TOS_SECRET_KEY=your-secret-key-here
-
-# VOD配置（使用统一AK/SK）
-VOD_ACCESS_KEY=your-access-key-here
-VOD_SECRET_KEY=your-secret-key-here
 
 # 工作流ID
 VOD_WORKFLOW_ID=your-workflow-id-here
 ```
 
-**注意：** 如果TOS和VOD使用相同的AK/SK（通常情况），只需设置 `ACCESS_KEY` 和 `SECRET_KEY`，程序会自动应用到TOS和VOD配置。如果它们使用不同的AK/SK，可以分别设置 `TOS_ACCESS_KEY`/`TOS_SECRET_KEY` 和 `VOD_ACCESS_KEY`/`VOD_SECRET_KEY`。
+**注意：** 程序统一使用 `ACCESS_KEY` 和 `SECRET_KEY` 作为 TOS/VOD 的 AK/SK。
 
 **方式二：使用config.yaml文件**
 
@@ -73,16 +65,16 @@ VOD_WORKFLOW_ID=your-workflow-id-here
 ```yaml
 # TOS配置
 tos:
-  access_key: ""  # 从.env文件或环境变量TOS_ACCESS_KEY获取
-  secret_key: ""  # 从.env文件或环境变量TOS_SECRET_KEY获取
+  access_key: ""  # 从.env文件或环境变量ACCESS_KEY获取
+  secret_key: ""  # 从.env文件或环境变量SECRET_KEY获取
   endpoint: "https://tos-cn-beijing.volces.com"
   region: "cn-beijing"
   bucket_name: "dji-vod-poc"
 
 # VOD配置
 vod:
-  access_key: ""  # 从.env文件或环境变量VOD_ACCESS_KEY获取
-  secret_key: ""  # 从.env文件或环境变量VOD_SECRET_KEY获取
+  access_key: ""  # 从.env文件或环境变量ACCESS_KEY获取
+  secret_key: ""  # 从.env文件或环境变量SECRET_KEY获取
   region: "cn-north-1"
   space_name: "space-dji"
   workflow_id: "d4dafb5eb8c0477eac792f331f875fdc"  # 或从.env文件VOD_WORKFLOW_ID获取
@@ -97,10 +89,8 @@ video:
 **方式三：使用系统环境变量**
 
 ```bash
-export TOS_ACCESS_KEY="your-tos-access-key"
-export TOS_SECRET_KEY="your-tos-secret-key"
-export VOD_ACCESS_KEY="your-vod-access-key"
-export VOD_SECRET_KEY="your-vod-secret-key"
+export ACCESS_KEY="your-access-key"
+export SECRET_KEY="your-secret-key"
 export VOD_WORKFLOW_ID="your-workflow-id"
 ```
 
@@ -325,4 +315,3 @@ file:///path/to/player.html?url=<播放地址>
 ## 许可证
 
 本项目仅供演示使用。
-

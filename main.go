@@ -87,31 +87,15 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 
 	// 从环境变量获取密钥（优先级：环境变量 > 配置文件）
-	// 如果TOS和VOD使用相同的AK/SK，优先使用统一的ACCESS_KEY和SECRET_KEY
 	accessKey := os.Getenv("ACCESS_KEY")
 	secretKey := os.Getenv("SECRET_KEY")
 
-	// TOS配置
-	if envVal := os.Getenv("TOS_ACCESS_KEY"); envVal != "" {
-		config.TOS.AccessKey = envVal
-	} else if accessKey != "" {
+	if accessKey != "" {
 		config.TOS.AccessKey = accessKey
-	}
-	if envVal := os.Getenv("TOS_SECRET_KEY"); envVal != "" {
-		config.TOS.SecretKey = envVal
-	} else if secretKey != "" {
-		config.TOS.SecretKey = secretKey
-	}
-
-	// VOD配置
-	if envVal := os.Getenv("VOD_ACCESS_KEY"); envVal != "" {
-		config.VOD.AccessKey = envVal
-	} else if accessKey != "" {
 		config.VOD.AccessKey = accessKey
 	}
-	if envVal := os.Getenv("VOD_SECRET_KEY"); envVal != "" {
-		config.VOD.SecretKey = envVal
-	} else if secretKey != "" {
+	if secretKey != "" {
+		config.TOS.SecretKey = secretKey
 		config.VOD.SecretKey = secretKey
 	}
 	if envVal := os.Getenv("VOD_WORKFLOW_ID"); envVal != "" {
@@ -399,13 +383,13 @@ func main() {
 	// 验证必要配置
 	if config.TOS.AccessKey == "" || config.TOS.SecretKey == "" {
 		fmt.Fprintf(os.Stderr, "错误: TOS AccessKey或SecretKey未配置\n")
-		fmt.Fprintf(os.Stderr, "请在config.yaml中配置或设置环境变量TOS_ACCESS_KEY和TOS_SECRET_KEY\n")
+		fmt.Fprintf(os.Stderr, "请在config.yaml中配置或设置环境变量ACCESS_KEY和SECRET_KEY\n")
 		os.Exit(1)
 	}
 
 	if config.VOD.AccessKey == "" || config.VOD.SecretKey == "" {
 		fmt.Fprintf(os.Stderr, "错误: VOD AccessKey或SecretKey未配置\n")
-		fmt.Fprintf(os.Stderr, "请在config.yaml中配置或设置环境变量VOD_ACCESS_KEY和VOD_SECRET_KEY\n")
+		fmt.Fprintf(os.Stderr, "请在config.yaml中配置或设置环境变量ACCESS_KEY和SECRET_KEY\n")
 		os.Exit(1)
 	}
 

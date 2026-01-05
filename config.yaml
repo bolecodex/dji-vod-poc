@@ -1,15 +1,15 @@
 # TOS配置
 tos:
-  access_key: ""  # 从环境变量TOS_ACCESS_KEY获取或直接填写
-  secret_key: ""  # 从环境变量TOS_SECRET_KEY获取或直接填写
+  access_key: ""  # 从环境变量ACCESS_KEY获取或直接填写
+  secret_key: ""  # 从环境变量SECRET_KEY获取或直接填写
   endpoint: "https://tos-cn-beijing.volces.com"
   region: "cn-beijing"
   bucket_name: "dji-vod-poc"
 
 # VOD配置
 vod:
-  access_key: ""  # 从环境变量VOD_ACCESS_KEY获取或直接填写
-  secret_key: ""  # 从环境变量VOD_SECRET_KEY获取或直接填写
+  access_key: ""  # 从环境变量ACCESS_KEY获取或直接填写
+  secret_key: ""  # 从环境变量SECRET_KEY获取或直接填写
   region: "cn-north-1"
   space_name: "space-dji"
   workflow_id: "d4dafb5eb8c0477eac792f331f875fdc"  # 工作流ID
@@ -19,4 +19,3 @@ vod:
 video:
   input_path: "./video/原始婚礼片段.mp4"
   output_key_prefix: "videos/"  # TOS中的对象key前缀
-

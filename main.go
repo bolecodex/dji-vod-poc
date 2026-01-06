@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path"
@@ -378,6 +379,101 @@ func uploadVideoToTOS(config *Config, inputPath string) (string, int64, time.Dur
 	startTime := time.Now()
 	ctx := context.Background()
 
+	const multipartThreshold = int64(128 * 1024 * 1024)
+	const partSize = int64(20 * 1024 * 1024)
+
+	if fileSize >= multipartThreshold {
+		createOut, err := client.CreateMultipartUploadV2(ctx, &tos.CreateMultipartUploadV2Input{
+			Bucket: config.TOS.BucketName,
+			Key:    objectKey,
+		})
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("初始化分片上传失败: %v", err)
+		}
+
+		offset := int64(0)
+		partNumber := 1
+		parts := make([]tos.UploadedPartV2, 0, 32)
+		for offset < fileSize {
+			uploadSize := partSize
+			if fileSize-offset < partSize {
+				uploadSize = fileSize - offset
+			}
+
+			var partOut *tos.UploadPartV2Output
+			var lastErr error
+			for attempt := 1; attempt <= 5; attempt++ {
+				if _, err := file.Seek(offset, io.SeekStart); err != nil {
+					lastErr = err
+					break
+				}
+
+				out, err := client.UploadPartV2(ctx, &tos.UploadPartV2Input{
+					UploadPartBasicInput: tos.UploadPartBasicInput{
+						Bucket:     config.TOS.BucketName,
+						Key:        objectKey,
+						UploadID:   createOut.UploadID,
+						PartNumber: partNumber,
+					},
+					Content:       io.LimitReader(file, uploadSize),
+					ContentLength: uploadSize,
+				})
+				if err == nil {
+					partOut = out
+					lastErr = nil
+					break
+				}
+				lastErr = err
+				if attempt < 5 {
+					newClient, cErr := newTOSClient(config.TOS)
+					if cErr == nil {
+						client = newClient
+					}
+					time.Sleep(time.Duration(attempt*2) * time.Second)
+				}
+			}
+			if lastErr != nil {
+				_ = file.Close()
+				_, _ = client.AbortMultipartUpload(ctx, &tos.AbortMultipartUploadInput{
+					Bucket:   config.TOS.BucketName,
+					Key:      objectKey,
+					UploadID: createOut.UploadID,
+				})
+				if lastErr == io.EOF {
+					return "", 0, 0, fmt.Errorf("读取分片数据失败: %v", lastErr)
+				}
+				if strings.Contains(lastErr.Error(), "seek") {
+					return "", 0, 0, fmt.Errorf("定位文件分片失败: %v", lastErr)
+				}
+				return "", 0, 0, fmt.Errorf("上传分片失败: %v", lastErr)
+			}
+			parts = append(parts, tos.UploadedPartV2{PartNumber: partNumber, ETag: partOut.ETag})
+
+			offset += uploadSize
+			partNumber++
+		}
+
+		completeOut, err := client.CompleteMultipartUploadV2(ctx, &tos.CompleteMultipartUploadV2Input{
+			Bucket:   config.TOS.BucketName,
+			Key:      objectKey,
+			UploadID: createOut.UploadID,
+			Parts:    parts,
+		})
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("合并分片失败: %v", err)
+		}
+
+		uploadDuration := time.Since(startTime)
+		uploadSpeed := float64(fileSize) / uploadDuration.Seconds() / (1024 * 1024)
+		fmt.Printf("上传成功!\n")
+		fmt.Printf("Request ID: %s\n", completeOut.RequestID)
+		fmt.Printf("上传耗时: %.2f 秒\n", uploadDuration.Seconds())
+		fmt.Printf("上传速度: %.2f MB/s\n", uploadSpeed)
+		fmt.Println()
+
+		return objectKey, fileSize, uploadDuration, nil
+	}
+
 	output, err := client.PutObjectV2(ctx, &tos.PutObjectV2Input{
 		PutObjectBasicInput: tos.PutObjectBasicInput{
 			Bucket: config.TOS.BucketName,
@@ -447,6 +543,7 @@ func startWorkflow(vodClient VODClientInterface, config *Config, objectKey strin
 	fmt.Printf("文件路径: %s\n", objectKey)
 	fmt.Printf("存储桶: %s\n", config.TOS.BucketName)
 	fmt.Println("正在触发工作流...")
+	startTime := time.Now()
 
 	runId, err := vodClient.StartWorkflow(
 		config.VOD.SpaceName,
@@ -459,6 +556,7 @@ func startWorkflow(vodClient VODClientInterface, config *Config, objectKey strin
 	}
 
 	fmt.Printf("工作流任务ID (RunId): %s\n", runId)
+	fmt.Printf("转码任务提交时间: %s\n", startTime.Format(time.RFC3339))
 	fmt.Println()
 
 	return runId, nil
@@ -474,7 +572,12 @@ func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, stri
 	maxRetries := 120                 // 最多查询120次（20分钟）
 	retryInterval := 10 * time.Second // 每10秒查询一次
 
+	localStart := time.Now()
 	var vid string
+	var startTimeStr string
+	var startTime time.Time
+	var startTimeOk bool
+	var printedStart bool
 	for i := 0; i < maxRetries; i++ {
 		fmt.Printf("第 %d 次查询状态...\n", i+1)
 
@@ -487,6 +590,22 @@ func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, stri
 
 		status := result.Status
 		fmt.Printf("当前状态: %s\n", status)
+		if !printedStart {
+			if result.StartTime != "" {
+				startTimeStr = result.StartTime
+				if t, err := time.Parse(time.RFC3339, startTimeStr); err == nil {
+					startTime = t
+					startTimeOk = true
+				}
+				fmt.Printf("转码开始时间: %s\n", startTimeStr)
+				printedStart = true
+			} else if status == "Running" {
+				startTime = localStart
+				startTimeOk = true
+				fmt.Printf("转码开始时间: %s\n", startTime.Format(time.RFC3339))
+				printedStart = true
+			}
+		}
 
 		// 状态说明：
 		// "0" - 成功
@@ -508,8 +627,23 @@ func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, stri
 			}
 			fmt.Printf("模板ID: %s\n", result.TemplateId)
 			fmt.Printf("模板名称: %s\n", result.TemplateName)
-			if result.EndTime != "" {
-				fmt.Printf("完成时间: %s\n", result.EndTime)
+			endTimeStr := result.EndTime
+			if endTimeStr == "" {
+				endTimeStr = time.Now().Format(time.RFC3339)
+			}
+			fmt.Printf("转码结束时间: %s\n", endTimeStr)
+			if !printedStart {
+				fmt.Printf("转码开始时间: %s\n", localStart.Format(time.RFC3339))
+				startTime = localStart
+				startTimeOk = true
+				printedStart = true
+			}
+			if startTimeOk {
+				if endTime, err := time.Parse(time.RFC3339, endTimeStr); err == nil {
+					fmt.Printf("转码耗时: %s\n", endTime.Sub(startTime).Truncate(time.Second))
+				} else {
+					fmt.Printf("转码耗时: %s\n", time.Since(startTime).Truncate(time.Second))
+				}
 			}
 			fmt.Println()
 			return vid, status, transcodeInfo, nil
@@ -779,7 +913,7 @@ func displayTestResults(config *Config, uploadDuration time.Duration, fileSize i
 
 	if playInfo != nil && len(playInfo.PlayInfoList) > 0 {
 		transcodedSize := playInfo.PlayInfoList[0].Size
-		compressionRatio := float64(transcodedSize) / float64(fileSize) * 100
+		compressionRatio := (1 - float64(transcodedSize)/float64(fileSize)) * 100
 		fmt.Printf("原始文件大小: %.2f MB\n", float64(fileSize)/(1024*1024))
 		fmt.Printf("转码后文件大小: %.2f MB\n", float64(transcodedSize)/(1024*1024))
 		fmt.Printf("压缩比: %.2f%%\n", compressionRatio)
@@ -799,6 +933,31 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
 		os.Exit(1)
+	}
+
+	inputDir := "./video"
+	st, err := os.Stat(inputDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("未找到video目录: %s\n", inputDir)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "读取video目录失败: %v\n", err)
+		os.Exit(1)
+	}
+	if !st.IsDir() {
+		fmt.Fprintf(os.Stderr, "video路径不是目录: %s\n", inputDir)
+		os.Exit(1)
+	}
+
+	videoFiles, err := listVideoFiles(inputDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取video目录失败: %v\n", err)
+		os.Exit(1)
+	}
+	if len(videoFiles) == 0 {
+		fmt.Printf("video目录下未找到可处理的视频文件: %s\n", inputDir)
+		return
 	}
 
 	// 验证必要配置
@@ -825,21 +984,6 @@ func main() {
 	if vodClient == nil {
 		fmt.Fprintf(os.Stderr, "创建VOD客户端失败\n")
 		os.Exit(1)
-	}
-
-	inputDir := filepath.Dir(config.Video.InputPath)
-	if st, err := os.Stat(config.Video.InputPath); err == nil && st.IsDir() {
-		inputDir = config.Video.InputPath
-	}
-
-	videoFiles, err := listVideoFiles(inputDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "读取目录失败: %v\n", err)
-		os.Exit(1)
-	}
-	if len(videoFiles) == 0 {
-		fmt.Printf("目录下未找到可处理的视频文件: %s\n", inputDir)
-		return
 	}
 
 	results := make([]struct {

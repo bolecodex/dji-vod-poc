@@ -17,5 +17,5 @@ vod:
 
 # 视频配置
 video:
-  input_path: "./video/原始婚礼片段.mp4"
+  input_path: "./video"
   output_key_prefix: "videos/"  # TOS中的对象key前缀

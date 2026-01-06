@@ -569,8 +569,8 @@ func getWorkflowStatus(vodClient VODClientInterface, runId string) (string, stri
 	fmt.Println("=" + strings.Repeat("=", 60))
 
 	// 轮询查询状态
-	maxRetries := 120                 // 最多查询120次（20分钟）
-	retryInterval := 10 * time.Second // 每10秒查询一次
+	maxRetries := 720
+	retryInterval := 10 * time.Second
 
 	localStart := time.Now()
 	var vid string

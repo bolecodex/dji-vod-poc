@@ -246,6 +246,117 @@ func renameObject(ctx context.Context, client *tos.ClientV2, bucket, srcKey, dst
 	return err
 }
 
+func objectExists(ctx context.Context, client *tos.ClientV2, bucket, objectKey string) (bool, error) {
+	_, err := client.HeadObjectV2(ctx, &tos.HeadObjectV2Input{
+		Bucket: bucket,
+		Key:    strings.TrimPrefix(objectKey, "/"),
+	})
+	if err == nil {
+		return true, nil
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "invalid body") {
+		return false, nil
+	}
+	if strings.Contains(msg, "nosuchkey") || strings.Contains(msg, "no such key") || strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist") {
+		return false, nil
+	}
+	return false, err
+}
+
+func isHLSOutput(transcodeInfo *TranscodeInfo) bool {
+	if transcodeInfo == nil {
+		return false
+	}
+	format := strings.ToLower(strings.TrimSpace(transcodeInfo.Format))
+	store := strings.ToLower(strings.TrimSpace(transcodeInfo.StoreUri))
+	return format == "hls" || strings.HasSuffix(store, ".m3u8")
+}
+
+func buildTempWorkflowInputKey(originalObjectKey string) string {
+	dir := path.Dir(originalObjectKey)
+	base := path.Base(originalObjectKey)
+	ext := path.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if stem == "" {
+		stem = base
+	}
+	name := fmt.Sprintf("%s-wf-%s%s", stem, time.Now().Format("20060102T150405"), ext)
+	if dir == "." || dir == "/" {
+		return name
+	}
+	return path.Join(dir, name)
+}
+
+func ensureHLSOutputAvailable(vodClient VODClientInterface, config *Config, inputObjectKey, vid string, transcodeInfo *TranscodeInfo) (string, *TranscodeInfo, error) {
+	if !isHLSOutput(transcodeInfo) {
+		return vid, transcodeInfo, nil
+	}
+
+	ctx := context.Background()
+	client, err := newTOSClient(config.TOS)
+	if err != nil {
+		return vid, transcodeInfo, fmt.Errorf("初始化TOS客户端失败: %v", err)
+	}
+
+	bucket, srcKey, locErr := getTranscodedObjectLocation(config, transcodeInfo)
+	if locErr == nil && bucket != "" && srcKey != "" {
+		ok, exErr := objectExists(ctx, client, bucket, srcKey)
+		if exErr != nil {
+			return vid, transcodeInfo, fmt.Errorf("检查HLS产物是否存在失败: %v", exErr)
+		}
+		if ok {
+			return vid, transcodeInfo, nil
+		}
+	}
+
+	if strings.TrimSpace(inputObjectKey) == "" {
+		return vid, transcodeInfo, fmt.Errorf("HLS产物不存在，且输入对象Key为空，无法重新触发工作流")
+	}
+
+	if config.VOD.WorkflowID == "" {
+		return vid, transcodeInfo, fmt.Errorf("工作流ID未配置，无法重新触发工作流")
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		tempKey := buildTempWorkflowInputKey(inputObjectKey)
+		fmt.Printf("HLS产物不存在，重新触发工作流（%d/2），输入对象: %s\n", attempt, tempKey)
+
+		_, cpErr := client.CopyObject(ctx, &tos.CopyObjectInput{
+			Bucket:    config.TOS.BucketName,
+			Key:       strings.TrimPrefix(tempKey, "/"),
+			SrcBucket: config.TOS.BucketName,
+			SrcKey:    strings.TrimPrefix(inputObjectKey, "/"),
+		})
+		if cpErr != nil {
+			return vid, transcodeInfo, fmt.Errorf("复制输入对象失败: %v", cpErr)
+		}
+
+		runId, sErr := startWorkflow(vodClient, config, tempKey)
+		if sErr != nil {
+			return vid, transcodeInfo, sErr
+		}
+
+		newVid, _, newTrans, wErr := getWorkflowStatus(vodClient, runId)
+		if wErr != nil {
+			return vid, transcodeInfo, wErr
+		}
+
+		b2, k2, locErr2 := getTranscodedObjectLocation(config, newTrans)
+		if locErr2 == nil && b2 != "" && k2 != "" {
+			ok, exErr := objectExists(ctx, client, b2, k2)
+			if exErr != nil {
+				return newVid, newTrans, fmt.Errorf("检查HLS产物是否存在失败: %v", exErr)
+			}
+			if ok {
+				return newVid, newTrans, nil
+			}
+		}
+	}
+
+	return vid, transcodeInfo, fmt.Errorf("HLS产物不存在：StoreUri=%s", strings.TrimSpace(transcodeInfo.StoreUri))
+}
+
 func buildTosPresignedURL(tosCfg TOSConfig, bucket, objectKey string, expiresSeconds int64) (string, error) {
 	client, err := newTOSClient(tosCfg)
 	if err != nil {
@@ -752,6 +863,7 @@ func getPlayInfo(vodClient VODClientInterface, config *Config, vid, filePath str
 		}
 	}
 
+	isHLS := transcodeInfo != nil && (strings.EqualFold(strings.TrimSpace(transcodeInfo.Format), "hls") || strings.HasSuffix(strings.ToLower(strings.TrimSpace(transcodeInfo.StoreUri)), ".m3u8"))
 	if transcodeInfo != nil && strings.TrimSpace(transcodeInfo.StoreUri) != "" {
 		ctx := context.Background()
 		client, cErr := newTOSClient(config.TOS)
@@ -773,12 +885,16 @@ func getPlayInfo(vodClient VODClientInterface, config *Config, vid, filePath str
 		if strings.TrimSpace(srcKey) == "" {
 			return "", nil, fmt.Errorf("转码产物对象Key为空")
 		}
-		if srcKey != outputKey {
-			if rErr := renameObject(ctx, client, bucket, srcKey, outputKey); rErr != nil {
-				if strings.Contains(rErr.Error(), "does not exist") {
-					fmt.Printf("重命名对象跳过: %v\n", rErr)
-				} else {
-					return "", nil, fmt.Errorf("重命名对象失败: %v", rErr)
+		if isHLS {
+			outputKey = srcKey
+		} else {
+			if srcKey != outputKey {
+				if rErr := renameObject(ctx, client, bucket, srcKey, outputKey); rErr != nil {
+					if strings.Contains(rErr.Error(), "does not exist") {
+						fmt.Printf("重命名对象跳过: %v\n", rErr)
+					} else {
+						return "", nil, fmt.Errorf("重命名对象失败: %v", rErr)
+					}
 				}
 			}
 		}
@@ -1017,6 +1133,12 @@ func main() {
 		vid, _, transcodeInfo, err := getWorkflowStatus(vodClient, runId)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "查询转码状态失败: %v\n", err)
+			continue
+		}
+
+		vid, transcodeInfo, err = ensureHLSOutputAvailable(vodClient, config, objectKey, vid, transcodeInfo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "HLS产物校验失败: %v\n", err)
 			continue
 		}
 

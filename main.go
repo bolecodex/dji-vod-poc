@@ -479,6 +479,17 @@ func uploadVideoToTOS(config *Config, inputPath string) (string, int64, time.Dur
 		return "", 0, 0, fmt.Errorf("初始化TOS客户端失败: %v", err)
 	}
 
+	ctx := context.Background()
+	exists, exErr := objectExists(ctx, client, config.TOS.BucketName, objectKey)
+	if exErr != nil {
+		return "", 0, 0, fmt.Errorf("检查对象是否已存在失败: %v", exErr)
+	}
+	if exists {
+		fmt.Println("对象已存在，跳过上传")
+		fmt.Println()
+		return objectKey, fileSize, 0, nil
+	}
+
 	// 打开文件
 	file, err := os.Open(inputPath)
 	if err != nil {
@@ -488,7 +499,6 @@ func uploadVideoToTOS(config *Config, inputPath string) (string, int64, time.Dur
 
 	// 上传文件并记录时间
 	startTime := time.Now()
-	ctx := context.Background()
 
 	const multipartThreshold = int64(128 * 1024 * 1024)
 	const partSize = int64(20 * 1024 * 1024)
@@ -1023,9 +1033,14 @@ func displayTestResults(config *Config, uploadDuration time.Duration, fileSize i
 	fmt.Println("测试结果汇总")
 	fmt.Println("=" + strings.Repeat("=", 60))
 
-	uploadSpeed := float64(fileSize) / uploadDuration.Seconds() / (1024 * 1024)
-	fmt.Printf("上传速度: %.2f MB/s\n", uploadSpeed)
-	fmt.Printf("上传耗时: %.2f 秒\n", uploadDuration.Seconds())
+	if uploadDuration > 0 {
+		uploadSpeed := float64(fileSize) / uploadDuration.Seconds() / (1024 * 1024)
+		fmt.Printf("上传速度: %.2f MB/s\n", uploadSpeed)
+		fmt.Printf("上传耗时: %.2f 秒\n", uploadDuration.Seconds())
+	} else {
+		fmt.Printf("上传速度: -\n")
+		fmt.Printf("上传耗时: -\n")
+	}
 
 	if playInfo != nil && len(playInfo.PlayInfoList) > 0 {
 		transcodedSize := playInfo.PlayInfoList[0].Size

@@ -13,7 +13,7 @@ import (
 
 // VODClientInterface VOD客户端接口
 type VODClientInterface interface {
-	StartWorkflow(spaceName, workflowId, fileName, bucketName string) (string, error)
+	StartWorkflow(spaceName, workflowId, fileName, bucketName, clientToken string) (string, error)
 	GetWorkflowExecution(runId string) (*GetWorkflowExecutionResponse, error)
 	GetWorkflowExecutionResult(runId string) (string, *TranscodeInfo, error)
 	GetPlayInfo(vid, format, definition string) (*GetPlayInfoResponse, error)
@@ -82,7 +82,7 @@ func NewVODClient(accessKey, secretKey, region, apiEndpoint string) VODClientInt
 }
 
 // StartWorkflow 启动工作流
-func (c *VODClient) StartWorkflow(spaceName, workflowId, fileName, bucketName string) (string, error) {
+func (c *VODClient) StartWorkflow(spaceName, workflowId, fileName, bucketName, clientToken string) (string, error) {
 	// 根据文档，StartWorkflow需要使用DirectUrl方式指定TOS中的文件
 	directUrl := &business.DirectUrl{
 		FileName:   fileName,
@@ -91,8 +91,9 @@ func (c *VODClient) StartWorkflow(spaceName, workflowId, fileName, bucketName st
 	}
 
 	input := &request.VodStartWorkflowRequest{
-		TemplateId: workflowId,
-		DirectUrl:  directUrl,
+		TemplateId:  workflowId,
+		DirectUrl:   directUrl,
+		ClientToken: strings.TrimSpace(clientToken),
 	}
 
 	output, _, err := c.client.StartWorkflow(input)

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +28,19 @@ import (
 var vmafSupportChecked bool
 var vmafSupported bool
 var vmafSupportErr error
+
+func buildClientToken() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	suffix := hex.EncodeToString(b[:])
+	token := fmt.Sprintf("%d-%s", time.Now().UnixNano(), suffix)
+	if len(token) > 64 {
+		token = token[:64]
+	}
+	return token, nil
+}
 
 // Config 配置结构
 type Config struct {
@@ -256,21 +271,26 @@ func renameObject(ctx context.Context, client *tos.ClientV2, bucket, srcKey, dst
 }
 
 func objectExists(ctx context.Context, client *tos.ClientV2, bucket, objectKey string) (bool, error) {
-	_, err := client.HeadObjectV2(ctx, &tos.HeadObjectV2Input{
+	exists, _, err := objectExistsAndSize(ctx, client, bucket, objectKey)
+	return exists, err
+}
+
+func objectExistsAndSize(ctx context.Context, client *tos.ClientV2, bucket, objectKey string) (bool, int64, error) {
+	out, err := client.HeadObjectV2(ctx, &tos.HeadObjectV2Input{
 		Bucket: bucket,
 		Key:    strings.TrimPrefix(objectKey, "/"),
 	})
 	if err == nil {
-		return true, nil
+		return true, out.ContentLength, nil
 	}
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "invalid body") {
-		return false, nil
+		return false, 0, nil
 	}
 	if strings.Contains(msg, "nosuchkey") || strings.Contains(msg, "no such key") || strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist") {
-		return false, nil
+		return false, 0, nil
 	}
-	return false, err
+	return false, 0, err
 }
 
 func isHLSOutput(transcodeInfo *TranscodeInfo) bool {
@@ -328,20 +348,9 @@ func ensureHLSOutputAvailable(vodClient VODClientInterface, config *Config, inpu
 	}
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		tempKey := buildTempWorkflowInputKey(inputObjectKey)
-		fmt.Printf("HLS产物不存在，重新触发工作流（%d/2），输入对象: %s\n", attempt, tempKey)
+		fmt.Printf("HLS产物不存在，重新触发工作流（%d/2），输入对象: %s\n", attempt, inputObjectKey)
 
-		_, cpErr := client.CopyObject(ctx, &tos.CopyObjectInput{
-			Bucket:    config.TOS.BucketName,
-			Key:       strings.TrimPrefix(tempKey, "/"),
-			SrcBucket: config.TOS.BucketName,
-			SrcKey:    strings.TrimPrefix(inputObjectKey, "/"),
-		})
-		if cpErr != nil {
-			return vid, transcodeInfo, fmt.Errorf("复制输入对象失败: %v", cpErr)
-		}
-
-		runId, sErr := startWorkflow(vodClient, config, tempKey)
+		runId, sErr := startWorkflow(vodClient, config, inputObjectKey)
 		if sErr != nil {
 			return vid, transcodeInfo, sErr
 		}
@@ -802,23 +811,39 @@ func uploadVideoToTOS(config *Config, inputPath string) (string, int64, time.Dur
 	fmt.Println("步骤1: 上传视频到TOS桶")
 	fmt.Println("=" + strings.Repeat("=", 60))
 
-	// 检查文件是否存在
-	if _, err := os.Stat(inputPath); os.IsNotExist(err) {
-		return "", 0, 0, fmt.Errorf("视频文件不存在: %s", inputPath)
+	fileInfo, statErr := os.Stat(inputPath)
+	localExists := statErr == nil
+
+	fileSize := int64(0)
+	if localExists {
+		fileSize = fileInfo.Size()
+		fmt.Printf("文件路径: %s\n", inputPath)
+		fmt.Printf("文件大小: %.2f MB\n", float64(fileSize)/(1024*1024))
+	} else {
+		fmt.Printf("本地文件不存在，按对象Key处理: %s\n", inputPath)
 	}
 
-	// 获取文件信息
-	fileInfo, err := os.Stat(inputPath)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("获取文件信息失败: %v", err)
+	var objectKey string
+	if localExists {
+		fileName := filepath.Base(inputPath)
+		objectKey = config.Video.OutputKeyPrefix + fileName
+	} else {
+		candidate := strings.TrimSpace(inputPath)
+		candidate = strings.TrimPrefix(candidate, "/")
+		if strings.Contains(candidate, "://") {
+			return "", 0, 0, fmt.Errorf("输入不支持URL: %s", inputPath)
+		}
+		if strings.Contains(candidate, "/") {
+			objectKey = candidate
+		} else if strings.TrimSpace(config.Video.OutputKeyPrefix) != "" {
+			objectKey = config.Video.OutputKeyPrefix + candidate
+		} else {
+			objectKey = candidate
+		}
 	}
-	fileSize := fileInfo.Size()
-	fmt.Printf("文件路径: %s\n", inputPath)
-	fmt.Printf("文件大小: %.2f MB\n", float64(fileSize)/(1024*1024))
-
-	// 生成对象key
-	fileName := filepath.Base(inputPath)
-	objectKey := config.Video.OutputKeyPrefix + fileName
+	if strings.TrimSpace(objectKey) == "" {
+		return "", 0, 0, fmt.Errorf("对象Key为空")
+	}
 	fmt.Printf("对象Key: %s\n", objectKey)
 
 	// 初始化TOS客户端
@@ -828,14 +853,21 @@ func uploadVideoToTOS(config *Config, inputPath string) (string, int64, time.Dur
 	}
 
 	ctx := context.Background()
-	exists, exErr := objectExists(ctx, client, config.TOS.BucketName, objectKey)
+	exists, remoteSize, exErr := objectExistsAndSize(ctx, client, config.TOS.BucketName, objectKey)
 	if exErr != nil {
 		return "", 0, 0, fmt.Errorf("检查对象是否已存在失败: %v", exErr)
 	}
 	if exists {
-		fmt.Println("对象已存在，跳过上传")
+		if fileSize <= 0 && remoteSize > 0 {
+			fileSize = remoteSize
+			fmt.Printf("对象大小: %.2f MB\n", float64(fileSize)/(1024*1024))
+		}
+		fmt.Println("对象已存在，跳过上传，继续转码")
 		fmt.Println()
 		return objectKey, fileSize, 0, nil
+	}
+	if !localExists {
+		return "", 0, 0, fmt.Errorf("对象不存在且本地文件不存在，无法上传: %s", objectKey)
 	}
 
 	// 打开文件
@@ -1014,11 +1046,17 @@ func startWorkflow(vodClient VODClientInterface, config *Config, objectKey strin
 	fmt.Println("正在触发工作流...")
 	startTime := time.Now()
 
+	clientToken, err := buildClientToken()
+	if err != nil {
+		return "", fmt.Errorf("生成ClientToken失败: %v", err)
+	}
+
 	runId, err := vodClient.StartWorkflow(
 		config.VOD.SpaceName,
 		config.VOD.WorkflowID,
 		objectKey,
 		config.TOS.BucketName,
+		clientToken,
 	)
 	if err != nil {
 		return "", fmt.Errorf("触发工作流失败: %v", err)
@@ -1392,10 +1430,16 @@ func displayTestResults(config *Config, uploadDuration time.Duration, fileSize i
 
 	if playInfo != nil && len(playInfo.PlayInfoList) > 0 {
 		transcodedSize := playInfo.PlayInfoList[0].Size
-		compressionRatio := (1 - float64(transcodedSize)/float64(fileSize)) * 100
-		fmt.Printf("原始文件大小: %.2f MB\n", float64(fileSize)/(1024*1024))
-		fmt.Printf("转码后文件大小: %.2f MB\n", float64(transcodedSize)/(1024*1024))
-		fmt.Printf("压缩比: %.2f%%\n", compressionRatio)
+		if fileSize > 0 {
+			compressionRatio := (1 - float64(transcodedSize)/float64(fileSize)) * 100
+			fmt.Printf("原始文件大小: %.2f MB\n", float64(fileSize)/(1024*1024))
+			fmt.Printf("转码后文件大小: %.2f MB\n", float64(transcodedSize)/(1024*1024))
+			fmt.Printf("压缩比: %.2f%%\n", compressionRatio)
+		} else {
+			fmt.Printf("原始文件大小: -\n")
+			fmt.Printf("转码后文件大小: %.2f MB\n", float64(transcodedSize)/(1024*1024))
+			fmt.Printf("压缩比: -\n")
+		}
 		fmt.Printf("转码后分辨率: %dx%d\n", playInfo.PlayInfoList[0].Width, playInfo.PlayInfoList[0].Height)
 		fmt.Printf("转码后码率: %d bps\n", playInfo.PlayInfoList[0].Bitrate)
 
@@ -1407,6 +1451,12 @@ func displayTestResults(config *Config, uploadDuration time.Duration, fileSize i
 			}
 		}
 		sec := vmafSampleSeconds()
+		if _, err := os.Stat(inputPath); err != nil {
+			fmt.Printf("VMAF: -\n")
+			fmt.Println("播放器时延: 需要实际播放测试")
+			fmt.Println()
+			return
+		}
 		if w > 0 && h > 0 {
 			distorted := playURL
 			cleanup := func() {}

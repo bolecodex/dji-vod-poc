@@ -2,13 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -17,6 +22,10 @@ import (
 	"github.com/volcengine/ve-tos-golang-sdk/v2/tos/enum"
 	"gopkg.in/yaml.v3"
 )
+
+var vmafSupportChecked bool
+var vmafSupported bool
+var vmafSupportErr error
 
 // Config 配置结构
 type Config struct {
@@ -446,6 +455,345 @@ func buildTosPublicURL(endpoint, bucket, objectKey string) (string, error) {
 	u.Host = host
 	u.Path = "/" + strings.TrimPrefix(objectKey, "/")
 	return u.String(), nil
+}
+
+func vmafSampleSeconds() int {
+	value := strings.TrimSpace(os.Getenv("VMAF_SECONDS"))
+	if value == "" {
+		return 30
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 30
+	}
+	if n < 0 {
+		return 30
+	}
+	return n
+}
+
+func checkVMAFSupport() (bool, error) {
+	if vmafSupportChecked {
+		return vmafSupported, vmafSupportErr
+	}
+	vmafSupportChecked = true
+
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		vmafSupportErr = fmt.Errorf("未找到ffmpeg")
+		return false, vmafSupportErr
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		vmafSupportErr = fmt.Errorf("未找到ffprobe")
+		return false, vmafSupportErr
+	}
+
+	out, err := exec.Command("ffmpeg", "-hide_banner", "-filters").CombinedOutput()
+	if err != nil {
+		vmafSupportErr = fmt.Errorf("检查ffmpeg filters失败: %v", err)
+		return false, vmafSupportErr
+	}
+	if !bytes.Contains(bytes.ToLower(out), []byte("libvmaf")) {
+		vmafSupportErr = fmt.Errorf("ffmpeg缺少libvmaf")
+		return false, vmafSupportErr
+	}
+
+	vmafSupported = true
+	return true, nil
+}
+
+func probeVideoDimensions(input string) (int, int, error) {
+	out, err := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height",
+		"-of", "csv=s=x:p=0",
+		input,
+	).CombinedOutput()
+	if err != nil {
+		return 0, 0, fmt.Errorf("ffprobe失败: %v", err)
+	}
+	parts := strings.Split(strings.TrimSpace(string(out)), "x")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("ffprobe输出不合法: %s", strings.TrimSpace(string(out)))
+	}
+	w, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("解析宽度失败: %v", err)
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("解析高度失败: %v", err)
+	}
+	if w <= 0 || h <= 0 {
+		return 0, 0, fmt.Errorf("分辨率不合法: %dx%d", w, h)
+	}
+	return w, h, nil
+}
+
+func computeVMAF(referencePath, distortedInput string, width, height int, sampleSeconds int) (float64, error) {
+	ok, err := checkVMAFSupport()
+	if !ok {
+		return 0, err
+	}
+	if width <= 0 || height <= 0 {
+		return 0, fmt.Errorf("分辨率不合法: %dx%d", width, height)
+	}
+	if strings.TrimSpace(referencePath) == "" || strings.TrimSpace(distortedInput) == "" {
+		return 0, fmt.Errorf("参考或对比输入为空")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "vmaf-")
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logPath := filepath.Join(tmpDir, "vmaf.json")
+	filter := fmt.Sprintf(
+		"[0:v]setpts=PTS-STARTPTS,scale=%d:%d:flags=bicubic[ref];[1:v]setpts=PTS-STARTPTS,scale=%d:%d:flags=bicubic[dist];[dist][ref]libvmaf=log_fmt=json:log_path=%s",
+		width, height, width, height, logPath,
+	)
+
+	args := []string{"-hide_banner", "-y", "-i", referencePath}
+	if strings.Contains(strings.ToLower(distortedInput), ".m3u8") {
+		args = append(args,
+			"-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+			"-allowed_extensions", "ALL",
+		)
+	}
+	args = append(args, "-i", distortedInput)
+	if sampleSeconds > 0 {
+		args = append(args, "-t", strconv.Itoa(sampleSeconds))
+	}
+	args = append(args, "-an", "-sn", "-lavfi", filter, "-f", "null", "-")
+
+	cmd := exec.Command("ffmpeg", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("ffmpeg计算VMAF失败: %v", strings.TrimSpace(string(out)))
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return 0, fmt.Errorf("读取VMAF日志失败: %v", err)
+	}
+
+	var parsed struct {
+		PooledMetrics map[string]struct {
+			Mean float64 `json:"mean"`
+		} `json:"pooled_metrics"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return 0, fmt.Errorf("解析VMAF日志失败: %v", err)
+	}
+	metric, ok := parsed.PooledMetrics["vmaf"]
+	if !ok {
+		return 0, fmt.Errorf("VMAF日志缺少pooled_metrics.vmaf")
+	}
+	return metric.Mean, nil
+}
+
+func fetchTextFromURL(raw string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, raw, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func parseBucketAndObjectKeyFromURL(raw string) (string, string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", "", err
+	}
+	host := strings.TrimSpace(u.Hostname())
+	key := strings.TrimPrefix(u.Path, "/")
+	if host == "" || key == "" {
+		return "", "", fmt.Errorf("URL缺少host或path")
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) == 0 || parts[0] == "" {
+		return "", "", fmt.Errorf("无法从URL解析bucket")
+	}
+	return parts[0], key, nil
+}
+
+func rewriteExtXKeyLine(config *Config, bucket, playlistDir, line string, expiresSeconds int64) (string, error) {
+	idx := strings.Index(line, "URI=\"")
+	if idx < 0 {
+		return line, nil
+	}
+	start := idx + len("URI=\"")
+	end := strings.Index(line[start:], "\"")
+	if end < 0 {
+		return line, nil
+	}
+	uri := line[start : start+end]
+	if uri == "" {
+		return line, nil
+	}
+	if strings.Contains(uri, "://") {
+		return line, nil
+	}
+	pathPart := uri
+	if q := strings.IndexByte(pathPart, '?'); q >= 0 {
+		pathPart = pathPart[:q]
+	}
+	key := path.Clean(path.Join(playlistDir, pathPart))
+	signed, err := buildTosPresignedURL(config.TOS, bucket, key, expiresSeconds)
+	if err != nil {
+		return "", err
+	}
+	newLine := line[:start] + signed + line[start+end:]
+	return newLine, nil
+}
+
+func rewriteMediaPlaylist(config *Config, bucket, playlistKey, content string, expiresSeconds int64) (string, error) {
+	playlistDir := path.Dir(playlistKey)
+	lines := strings.Split(content, "\n")
+	for i := range lines {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#EXT-X-KEY") {
+			updated, err := rewriteExtXKeyLine(config, bucket, playlistDir, lines[i], expiresSeconds)
+			if err != nil {
+				return "", err
+			}
+			lines[i] = updated
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Contains(line, "://") {
+			continue
+		}
+		pathPart := line
+		if q := strings.IndexByte(pathPart, '?'); q >= 0 {
+			pathPart = pathPart[:q]
+		}
+		segmentKey := path.Clean(path.Join(playlistDir, pathPart))
+		signed, err := buildTosPresignedURL(config.TOS, bucket, segmentKey, expiresSeconds)
+		if err != nil {
+			return "", err
+		}
+		lines[i] = signed
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func prepareHLSPlaylistForFFmpeg(config *Config, playlistURL string, expiresSeconds int64) (string, func(), error) {
+	bucket, playlistKey, err := parseBucketAndObjectKeyFromURL(playlistURL)
+	if err != nil {
+		bucket = strings.TrimSpace(config.TOS.BucketName)
+	}
+	if bucket == "" {
+		return "", nil, fmt.Errorf("bucket为空")
+	}
+	if playlistKey == "" {
+		_, k, kErr := parseBucketAndObjectKeyFromURL(playlistURL)
+		if kErr != nil {
+			return "", nil, kErr
+		}
+		playlistKey = k
+	}
+
+	rootContent, err := fetchTextFromURL(playlistURL)
+	if err != nil {
+		return "", nil, err
+	}
+
+	tmpDir, err := os.MkdirTemp("", "hls-vmaf-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+
+	writeFile := func(name string, text string) (string, error) {
+		p := filepath.Join(tmpDir, name)
+		if err := os.WriteFile(p, []byte(text), 0o600); err != nil {
+			return "", err
+		}
+		return p, nil
+	}
+
+	isMaster := strings.Contains(rootContent, "#EXT-X-STREAM-INF")
+	if !isMaster {
+		rewritten, err := rewriteMediaPlaylist(config, bucket, playlistKey, rootContent, expiresSeconds)
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		p, err := writeFile("root.m3u8", rewritten)
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		return p, cleanup, nil
+	}
+
+	rootDirKey := path.Dir(playlistKey)
+	lines := strings.Split(rootContent, "\n")
+	variantIndex := 0
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Contains(line, "://") {
+			continue
+		}
+		pathPart := line
+		if q := strings.IndexByte(pathPart, '?'); q >= 0 {
+			pathPart = pathPart[:q]
+		}
+		variantKey := path.Clean(path.Join(rootDirKey, pathPart))
+		variantURL, err := buildTosPresignedURL(config.TOS, bucket, variantKey, expiresSeconds)
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		variantContent, err := fetchTextFromURL(variantURL)
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		rewrittenVariant, err := rewriteMediaPlaylist(config, bucket, variantKey, variantContent, expiresSeconds)
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		localVariantName := fmt.Sprintf("variant-%d.m3u8", variantIndex)
+		variantIndex++
+		localVariantPath, err := writeFile(localVariantName, rewrittenVariant)
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		lines[i] = localVariantPath
+	}
+
+	rootPath, err := writeFile("master.m3u8", strings.Join(lines, "\n"))
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return rootPath, cleanup, nil
 }
 
 // 上传视频到TOS
@@ -1028,7 +1376,7 @@ func getPlayInfo(vodClient VODClientInterface, config *Config, vid, filePath str
 }
 
 // 显示测试结果
-func displayTestResults(config *Config, uploadDuration time.Duration, fileSize int64, playInfo *GetPlayInfoResponse) {
+func displayTestResults(config *Config, uploadDuration time.Duration, fileSize int64, inputPath string, playURL string, playInfo *GetPlayInfoResponse) {
 	fmt.Println("=" + strings.Repeat("=", 60))
 	fmt.Println("测试结果汇总")
 	fmt.Println("=" + strings.Repeat("=", 60))
@@ -1050,6 +1398,39 @@ func displayTestResults(config *Config, uploadDuration time.Duration, fileSize i
 		fmt.Printf("压缩比: %.2f%%\n", compressionRatio)
 		fmt.Printf("转码后分辨率: %dx%d\n", playInfo.PlayInfoList[0].Width, playInfo.PlayInfoList[0].Height)
 		fmt.Printf("转码后码率: %d bps\n", playInfo.PlayInfoList[0].Bitrate)
+
+		w, h := playInfo.PlayInfoList[0].Width, playInfo.PlayInfoList[0].Height
+		if w <= 0 || h <= 0 {
+			pw, ph, pErr := probeVideoDimensions(playURL)
+			if pErr == nil {
+				w, h = pw, ph
+			}
+		}
+		sec := vmafSampleSeconds()
+		if w > 0 && h > 0 {
+			distorted := playURL
+			cleanup := func() {}
+			if strings.HasSuffix(strings.ToLower(strings.TrimSpace(playURL)), ".m3u8") || strings.EqualFold(strings.TrimSpace(playInfo.PlayInfoList[0].Format), "hls") {
+				localPlaylist, cl, pErr := prepareHLSPlaylistForFFmpeg(config, playURL, 3600)
+				if pErr == nil {
+					distorted = localPlaylist
+					cleanup = cl
+				}
+			}
+			score, vErr := computeVMAF(inputPath, distorted, w, h, sec)
+			cleanup()
+			if vErr == nil {
+				if sec > 0 {
+					fmt.Printf("VMAF(%ds): %.2f\n", sec, score)
+				} else {
+					fmt.Printf("VMAF: %.2f\n", score)
+				}
+			} else {
+				fmt.Printf("VMAF: -\n")
+			}
+		} else {
+			fmt.Printf("VMAF: -\n")
+		}
 	}
 	fmt.Println("播放器时延: 需要实际播放测试")
 	fmt.Println()
@@ -1066,29 +1447,39 @@ func main() {
 		os.Exit(1)
 	}
 
-	inputDir := "./video"
+	inputDir := strings.TrimSpace(config.Video.InputPath)
+	if inputDir == "" {
+		inputDir = "./video"
+	}
 	st, err := os.Stat(inputDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			fmt.Printf("未找到video目录: %s\n", inputDir)
+			fmt.Printf("未找到输入路径: %s\n", inputDir)
 			return
 		}
-		fmt.Fprintf(os.Stderr, "读取video目录失败: %v\n", err)
-		os.Exit(1)
-	}
-	if !st.IsDir() {
-		fmt.Fprintf(os.Stderr, "video路径不是目录: %s\n", inputDir)
+		fmt.Fprintf(os.Stderr, "读取输入路径失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	videoFiles, err := listVideoFiles(inputDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "读取video目录失败: %v\n", err)
-		os.Exit(1)
-	}
-	if len(videoFiles) == 0 {
-		fmt.Printf("video目录下未找到可处理的视频文件: %s\n", inputDir)
-		return
+	var videoFiles []string
+	if st.IsDir() {
+		videoFiles, err = listVideoFiles(inputDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "读取输入目录失败: %v\n", err)
+			os.Exit(1)
+		}
+		if len(videoFiles) == 0 {
+			if _, err := os.Stat("./hunli.MP4"); err == nil {
+				videoFiles = []string{"./hunli.MP4"}
+			} else if _, err := os.Stat("./hunli.mp4"); err == nil {
+				videoFiles = []string{"./hunli.mp4"}
+			} else {
+				fmt.Printf("输入目录下未找到可处理的视频文件: %s\n", inputDir)
+				return
+			}
+		}
+	} else {
+		videoFiles = []string{inputDir}
 	}
 
 	// 验证必要配置
@@ -1163,7 +1554,7 @@ func main() {
 			continue
 		}
 
-		displayTestResults(config, uploadDuration, fileSize, playInfo)
+		displayTestResults(config, uploadDuration, fileSize, inputPath, playUrl, playInfo)
 
 		fmt.Println("=" + strings.Repeat("=", 60))
 		fmt.Println("本文件处理完成!")
